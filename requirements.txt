@@ -1,5 +1,6 @@
 streamlit>=1.36
 openai>=1.30
+google-genai>=0.3
 pandas>=2.0
 plotly>=5.20
 deep-translator>=1.11
