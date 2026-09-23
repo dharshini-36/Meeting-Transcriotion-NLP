@@ -367,8 +367,34 @@ def generate_pdf(meeting_title: str, data: dict) -> bytes:
 
 
 # ============================================================================
-# SECTION 4: TRANSLATION (free, via deep-translator / Google Translate)
+# SECTION 4: TRANSLATION
+# ----------------------------------------------------------------------------
+# Default: deep-translator's GoogleTranslator, which calls the SAME engine
+# that powers translate.google.com. It's free, needs no key, and for the
+# languages below the output quality matches Google's official (paid)
+# Cloud Translation API — it's just an unofficial wrapper, not a certified
+# integration, so it can occasionally need a library update if Google
+# changes the page it talks to.
+#
+# If you want an officially-supported vendor instead, set the DEEPL_API_KEY
+# environment variable (a free DeepL account gives 500,000 chars/month) —
+# this app then uses DeepL automatically for any language it supports.
+# No in-app field, no prompt: set the env var once outside the app and
+# restart it. Anything DeepL doesn't cover (e.g. Tamil, Telugu, Kannada,
+# Malayalam as of writing) still falls back to the free Google engine.
 # ============================================================================
+
+import os
+
+DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY", "").strip()
+
+# DeepL's target-language codes for the languages this app offers.
+# Languages not listed here aren't supported by DeepL and always use the
+# free Google engine instead.
+DEEPL_LANG_MAP = {
+    "en": "EN-US", "fr": "FR", "de": "DE", "es": "ES",
+    "zh-CN": "ZH", "ja": "JA", "ar": "AR",
+}
 
 LANGUAGES = {
     "English": "en", "Hindi": "hi", "Tamil": "ta", "Telugu": "te",
@@ -378,11 +404,25 @@ LANGUAGES = {
 _CHUNK_SIZE = 4500
 
 
+def _translate_chunk_deepl(text: str, deepl_code: str) -> str:
+    import deepl
+    translator = deepl.Translator(DEEPL_API_KEY)
+    return translator.translate_text(text, target_lang=deepl_code).text
+
+
 def translate_text(text: str, target_lang_code: str) -> str:
     if not text or target_lang_code == "en":
         return text
-    translator = GoogleTranslator(source="auto", target=target_lang_code)
     chunks = [text[i:i + _CHUNK_SIZE] for i in range(0, len(text), _CHUNK_SIZE)]
+
+    if DEEPL_API_KEY and target_lang_code in DEEPL_LANG_MAP:
+        try:
+            deepl_code = DEEPL_LANG_MAP[target_lang_code]
+            return " ".join(_translate_chunk_deepl(c, deepl_code) for c in chunks)
+        except Exception:
+            pass  # DeepL hiccup (quota, network, bad key) — fall back to free Google engine below
+
+    translator = GoogleTranslator(source="auto", target=target_lang_code)
     return " ".join(translator.translate(chunk) for chunk in chunks)
 
 
