@@ -119,7 +119,7 @@ def delete_meeting(meeting_id: int):
 # ============================================================================
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-EXTRACTION_MODEL = "gemini-2.0-flash"
+EXTRACTION_MODEL = "gemini-2.5-flash"
 
 
 def _client(api_key: str) -> OpenAI:
@@ -138,7 +138,7 @@ def transcribe_audio(file_path: str, api_key: str) -> str:
     client = google_genai.Client(api_key=api_key)
     uploaded = client.files.upload(file=file_path)
     response = client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="gemini-2.5-flash",
         contents=[
             uploaded,
             "Transcribe this audio verbatim. If multiple speakers are "
