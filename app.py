@@ -1,390 +1,303 @@
-import re
-from datetime import datetime
-import pandas as pd
 import streamlit as st
-from transformers import pipeline
+import pandas as pd
+import matplotlib.pyplot as plt
+import datetime
 
-st.set_page_config(
-    page_title="Meeting Intelligence AI",
-    page_icon="🤖",
-    layout="wide"
+from src.nlp_pipeline import (
+    clean_transcript, extract_entities, summarize_text,
+    extract_key_points, extract_decisions, extract_action_items,
 )
+from src.priority import annotate_priorities
+from src.speaker import parse_speakers, build_speaker_char_map, plain_transcript
+from src.qa_engine import answer_question, search_transcript
+from src.translator import translate_text, LANGUAGES
+from src.database import save_meeting, list_meetings, get_meeting, delete_meeting
+from src.export_utils import (
+    action_items_to_csv_bytes, action_items_to_ics_bytes,
+    report_to_docx_bytes, report_to_pdf_bytes,
+)
+from src.email_generator import generate_all_drafts
 
-st.title("🤖 Meeting Intelligence AI")
-st.caption("Convert meeting audio or transcripts into summaries, decisions, action items and deadlines.")
+st.set_page_config(page_title="Meeting-to-Action-Items AI", page_icon="🎤", layout="wide")
 
-# -----------------------------
-# Model
-# -----------------------------
-@st.cache_resource
-def load_classifier():
-    # BART-large-MNLI is used as a zero-shot text classifier.
-    # It is an NLP transformer model and works without a custom training dataset.
-    return pipeline(
-        "zero-shot-classification",
-        model="facebook/bart-large-mnli"
+# ---------------------------------------------------------------- session state
+if "analysis" not in st.session_state:
+    st.session_state.analysis = None
+if "user_name" not in st.session_state:
+    st.session_state.user_name = ""
+
+# ---------------------------------------------------------------- sidebar
+with st.sidebar:
+    st.title("🎤 Meeting AI")
+    st.caption("NLP-powered meeting summarizer & task extractor")
+    st.session_state.user_name = st.text_input(
+        "Your name (for 'my tasks' Q&A)", value=st.session_state.user_name
     )
-
-classifier = load_classifier()
-
-LABELS = [
-    "action item",
-    "decision",
-    "discussion",
-    "question",
-    "information or update"
-]
-
-# -----------------------------
-# Helper functions
-# -----------------------------
-def split_sentences(text):
-    text = re.sub(r"\s+", " ", text).strip()
-    if not text:
-        return []
-    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
-
-
-def classify_sentences(sentences):
-    rows = []
-
-    for sentence in sentences:
-        result = classifier(
-            sentence,
-            candidate_labels=LABELS,
-            multi_label=False
-        )
-
-        rows.append({
-            "Sentence": sentence,
-            "Category": result["labels"][0],
-            "Confidence": round(float(result["scores"][0]) * 100, 2)
-        })
-
-    return pd.DataFrame(rows)
-
-
-def extract_people(text):
-    # Detect simple "Name:" speaker patterns such as Rahul: or Priya:
-    names = re.findall(r"\b([A-Z][a-z]{2,20})\s*:", text)
-    return sorted(set(names))
-
-
-def extract_dates(text):
-    patterns = [
-        r"\b(?:today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-        r"\b(?:next week|next month|this week|this month)\b",
-        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
-        r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)"
-        r"\s+\d{1,2}(?:,\s*\d{4})?\b"
-    ]
-
-    found = []
-    for pattern in patterns:
-        found.extend(re.findall(pattern, text, flags=re.IGNORECASE))
-
-    return sorted(set(found), key=str.lower)
-
-
-def extract_entities(text):
-    people = extract_people(text)
-
-    # Simple project/organization candidates from capitalized multi-word names.
-    organizations = re.findall(
-        r"\b(?:[A-Z][A-Za-z0-9&.-]*\s+){1,3}(?:Technologies|Technology|Solutions|Company|Corporation|University|College|Inc|Ltd)\b",
-        text
+    page = st.radio(
+        "Navigate",
+        ["🆕 New Meeting", "📊 Dashboard", "❓ Ask Questions", "🔎 Search",
+         "📜 History", "📤 Export"],
     )
+    st.divider()
+    st.caption("Built with spaCy NER + DistilBART summarization + "
+               "zero-shot DistilBERT priority classification.")
 
-    return {
-        "People": sorted(set(people)),
-        "Organizations": sorted(set(organizations))
+
+def run_pipeline(transcript_raw: str, meeting_title: str):
+    transcript_raw = clean_transcript(transcript_raw)
+    segments, speaker_counts = parse_speakers(transcript_raw)
+    char_map = build_speaker_char_map(segments)
+    plain_text = plain_transcript(segments) if segments else transcript_raw
+
+    with st.spinner("Summarizing meeting..."):
+        summary = summarize_text(plain_text)
+    with st.spinner("Extracting entities..."):
+        entities = extract_entities(plain_text)
+    with st.spinner("Identifying key discussion points..."):
+        key_points = extract_key_points(plain_text)
+    with st.spinner("Detecting decisions..."):
+        decisions = extract_decisions(plain_text)
+    with st.spinner("Extracting action items..."):
+        action_items = extract_action_items(plain_text, speaker_map=char_map)
+    with st.spinner("Scoring priority..."):
+        action_items = annotate_priorities(action_items)
+    for item in action_items:
+        item["status"] = "Pending"
+
+    data = {
+        "title": meeting_title,
+        "transcript": transcript_raw,
+        "plain_text": plain_text,
+        "summary": summary,
+        "entities": entities,
+        "key_points": key_points,
+        "decisions": decisions,
+        "action_items": action_items,
+        "speaker_counts": speaker_counts,
     }
+    st.session_state.analysis = data
+    save_meeting(meeting_title, transcript_raw, summary, data)
+    return data
 
 
-def extract_action_items(classified_df):
-    actions = classified_df[
-        classified_df["Category"].str.lower() == "action item"
-    ].copy()
+# ---------------------------------------------------------------- New Meeting
+if page == "🆕 New Meeting":
+    st.header("New Meeting")
+    meeting_title = st.text_input("Meeting title", value=f"Meeting {datetime.date.today()}")
 
-    result = []
+    input_mode = st.radio("Input type", ["📄 Paste / upload transcript", "🎧 Upload audio"], horizontal=True)
 
-    for _, row in actions.iterrows():
-        sentence = row["Sentence"]
-
-        # Try to identify an explicit speaker.
-        person_match = re.match(r"^\s*([A-Z][a-z]{2,20})\s*:", sentence)
-        person = person_match.group(1) if person_match else "Not specified"
-
-        # Remove speaker name from task text.
-        task = re.sub(r"^\s*[A-Z][a-z]{2,20}\s*:\s*", "", sentence)
-
-        result.append({
-            "Assigned Person": person,
-            "Action Item": task,
-            "Deadline": "Not specified",
-            "Confidence": row["Confidence"]
-        })
-
-    return pd.DataFrame(result)
-
-
-def build_summary(classified_df):
-    if classified_df.empty:
-        return "No meeting content was detected."
-
-    important = classified_df[
-        classified_df["Category"].str.lower().isin(
-            ["action item", "decision", "discussion", "information or update"]
+    transcript_text = ""
+    if input_mode == "📄 Paste / upload transcript":
+        uploaded = st.file_uploader("Upload a .txt transcript (optional)", type=["txt"])
+        if uploaded:
+            transcript_text = uploaded.read().decode("utf-8", errors="ignore")
+        transcript_text = st.text_area(
+            "Or paste transcript here (tip: prefix lines with 'Name: ' for speaker identification)",
+            value=transcript_text, height=280,
+            placeholder="Dharshini: I'll fix the login bug by Friday.\nPriya: I'll prepare test cases by Thursday.\n...",
         )
-    ]
-
-    if important.empty:
-        return "The meeting did not contain enough classified information."
-
-    sentences = important["Sentence"].tolist()[:5]
-    return " ".join(sentences)
-
-
-def create_report(summary, discussions, decisions, actions, entities, dates):
-    lines = [
-        "# Meeting Intelligence Report",
-        "",
-        "## Meeting Summary",
-        summary,
-        "",
-        "## Key Discussion Points"
-    ]
-
-    for item in discussions:
-        lines.append(f"- {item}")
-
-    lines += ["", "## Decisions Made"]
-
-    for item in decisions:
-        lines.append(f"- {item}")
-
-    lines += ["", "## Action Items"]
-
-    if actions.empty:
-        lines.append("- No action items detected.")
     else:
-        for _, row in actions.iterrows():
-            lines.append(
-                f"- {row['Assigned Person']}: {row['Action Item']} "
-                f"(Deadline: {row['Deadline']})"
+        audio_file = st.file_uploader("Upload audio (wav/mp3/m4a)", type=["wav", "mp3", "m4a"])
+        st.caption("Uses a free online speech-to-text service - best for short, clear recordings.")
+        if audio_file and st.button("Transcribe audio"):
+            from src.speech_to_text import audio_file_to_wav, transcribe_wav
+            with st.spinner("Converting and transcribing audio... this can take a while."):
+                wav_path = audio_file_to_wav(audio_file)
+                transcript_text = transcribe_wav(wav_path)
+            st.success("Transcription complete - review/edit below before analyzing.")
+        transcript_text = st.text_area("Transcript (from audio)", value=transcript_text, height=280)
+
+    if st.button("🧠 Analyze Meeting", type="primary", disabled=not transcript_text.strip()):
+        run_pipeline(transcript_text, meeting_title)
+        st.success("Analysis complete! Head to the Dashboard tab.")
+
+# ---------------------------------------------------------------- Dashboard
+elif page == "📊 Dashboard":
+    data = st.session_state.analysis
+    if not data:
+        st.info("No meeting analyzed yet. Go to **New Meeting** first, or load one from **History**.")
+    else:
+        st.header(f"📊 Dashboard — {data['title']}")
+
+        st.subheader("📋 Meeting Summary")
+        st.write(data["summary"])
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("💬 Key Discussion Points")
+            for p in data["key_points"]:
+                st.markdown(f"- {p}")
+        with col2:
+            st.subheader("🎯 Decisions Made")
+            if data["decisions"]:
+                for d in data["decisions"]:
+                    st.markdown(f"- {d}")
+            else:
+                st.caption("No explicit decisions detected.")
+
+        st.subheader("✅ Action Items")
+        df = pd.DataFrame(data["action_items"])
+        if not df.empty:
+            edited = st.data_editor(
+                df[["person", "task", "deadline", "priority", "status"]],
+                column_config={
+                    "status": st.column_config.SelectboxColumn(
+                        options=["Pending", "In Progress", "Completed"]
+                    ),
+                    "priority": st.column_config.SelectboxColumn(
+                        options=["High", "Medium", "Low"]
+                    ),
+                },
+                num_rows="dynamic", use_container_width=True, key="editor",
             )
+            # persist edits back into session state
+            data["action_items"] = edited.to_dict("records")
+        else:
+            st.caption("No action items detected.")
 
-    lines += ["", "## Important Entities"]
-    lines.append(f"- People: {', '.join(entities['People']) or 'None detected'}")
-    lines.append(
-        f"- Organizations: {', '.join(entities['Organizations']) or 'None detected'}"
-    )
-    lines.append(f"- Dates/Deadlines: {', '.join(dates) or 'None detected'}")
+        st.subheader("🏷️ Important Entities")
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("People", len(data["entities"]["people"]))
+        e2.metric("Organizations", len(data["entities"]["organizations"]))
+        e3.metric("Dates", len(data["entities"]["dates"]))
+        e4.metric("Projects/Tech", len(data["entities"]["projects_tech"]))
+        with st.expander("View entity details"):
+            st.json(data["entities"])
 
-    return "\n".join(lines)
+        st.subheader("📈 Visual Insights")
+        v1, v2 = st.columns(2)
+        with v1:
+            if data["action_items"]:
+                counts = pd.Series([i["person"] for i in data["action_items"]]).value_counts()
+                fig, ax = plt.subplots()
+                counts.plot(kind="barh", ax=ax, color="#4F46E5")
+                ax.set_xlabel("Number of tasks")
+                ax.set_title("Action Items by Person")
+                st.pyplot(fig)
+        with v2:
+            if data["action_items"]:
+                status_counts = pd.Series([i.get("status", "Pending") for i in data["action_items"]]).value_counts()
+                fig2, ax2 = plt.subplots()
+                ax2.pie(status_counts, labels=status_counts.index, autopct="%1.0f%%",
+                        colors=["#F59E0B", "#3B82F6", "#10B981"])
+                ax2.set_title("Task Status")
+                st.pyplot(fig2)
 
+        if data["speaker_counts"] and len(data["speaker_counts"]) > 1:
+            st.subheader("🎙️ Speaker Participation")
+            sp_df = pd.Series(data["speaker_counts"]).sort_values(ascending=False)
+            st.bar_chart(sp_df)
 
-# -----------------------------
-# Input section
-# -----------------------------
-st.sidebar.header("Input")
-
-input_type = st.sidebar.radio(
-    "Choose input type",
-    ["Transcript", "Audio"]
-)
-
-transcript = ""
-
-if input_type == "Transcript":
-    transcript = st.text_area(
-        "Paste meeting transcript",
-        height=300,
-        placeholder=(
-            "Example:\n"
-            "Rahul: We need to finish the homepage by Friday.\n"
-            "Dharshini: I'll handle the frontend implementation.\n"
-            "Priya: I'll prepare the test cases tomorrow.\n"
-            "Rahul: Let's review everything on Friday."
+        st.subheader("📅 Upcoming Deadlines")
+        deadline_df = pd.DataFrame(
+            [i for i in data["action_items"] if i["deadline"] != "Not specified"]
         )
-    )
+        if not deadline_df.empty:
+            st.dataframe(deadline_df[["person", "task", "deadline"]], use_container_width=True)
+        else:
+            st.caption("No explicit deadlines detected.")
 
-else:
-    audio_file = st.file_uploader(
-        "Upload meeting audio",
-        type=["wav", "mp3", "m4a", "ogg"]
-    )
+        st.subheader("📧 Generated Email Drafts")
+        drafts = generate_all_drafts(data["action_items"], data["title"])
+        if drafts:
+            for d in drafts:
+                with st.expander(f"✉️ To: {d['to']} — {d['subject']}"):
+                    st.text(d["body"])
+        else:
+            st.caption("No assigned-person action items to draft emails for yet.")
 
-    st.info(
-        "Audio transcription is optional in this starter version. "
-        "To enable automatic speech-to-text, add a Whisper model/API and "
-        "pass its transcript to the NLP pipeline."
-    )
-
-    if audio_file:
-        st.audio(audio_file)
-
-        st.warning(
-            "For the current version, paste the generated transcript below "
-            "after transcribing the audio."
-        )
-
-        transcript = st.text_area(
-            "Paste audio transcript",
-            height=250
-        )
-
-
-if st.button("🚀 Analyze Meeting", type="primary"):
-    if not transcript.strip():
-        st.error("Please provide a meeting transcript.")
-        st.stop()
-
-    with st.spinner("Analyzing meeting..."):
-        sentences = split_sentences(transcript)
-        classified_df = classify_sentences(sentences)
-
-        actions = extract_action_items(classified_df)
-
-        discussions = classified_df[
-            classified_df["Category"].str.lower() == "discussion"
-        ]["Sentence"].tolist()
-
-        decisions = classified_df[
-            classified_df["Category"].str.lower() == "decision"
-        ]["Sentence"].tolist()
-
-        summary = build_summary(classified_df)
-        entities = extract_entities(transcript)
-        dates = extract_dates(transcript)
-
-    st.success("Meeting analysis completed.")
-
-    # -----------------------------
-    # Dashboard metrics
-    # -----------------------------
-    st.subheader("📊 Dashboard")
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-        st.metric("Total Sentences", len(classified_df))
-
-    with col2:
-        st.metric("Action Items", len(actions))
-
-    with col3:
-        st.metric("Decisions", len(decisions))
-
-    with col4:
-        st.metric("Deadlines Found", len(dates))
-
-    # -----------------------------
-    # Summary
-    # -----------------------------
-    st.subheader("📋 Meeting Summary")
-    st.write(summary)
-
-    # -----------------------------
-    # Visual category chart
-    # -----------------------------
-    st.subheader("📈 Conversation Analysis")
-
-    category_counts = classified_df["Category"].value_counts()
-    st.bar_chart(category_counts)
-
-    # -----------------------------
-    # Discussions
-    # -----------------------------
-    st.subheader("💬 Key Discussion Points")
-
-    if discussions:
-        for item in discussions:
-            st.write(f"• {item}")
+# ---------------------------------------------------------------- Ask Questions
+elif page == "❓ Ask Questions":
+    data = st.session_state.analysis
+    if not data:
+        st.info("Analyze a meeting first.")
     else:
-        st.write("No discussion points detected.")
+        st.header("❓ Ask About This Meeting")
+        st.caption('Try: "What tasks were assigned to me?" or "What did we decide about the homepage?"')
+        q = st.text_input("Your question")
+        if st.button("Ask", type="primary", disabled=not q.strip()):
+            with st.spinner("Thinking..."):
+                answer = answer_question(q, data["plain_text"], data["action_items"], st.session_state.user_name)
+            st.markdown(f"**Answer:** {answer}")
 
-    # -----------------------------
-    # Decisions
-    # -----------------------------
-    st.subheader("🎯 Decisions Made")
-
-    if decisions:
-        for item in decisions:
-            st.write(f"• {item}")
+# ---------------------------------------------------------------- Search
+elif page == "🔎 Search":
+    data = st.session_state.analysis
+    if not data:
+        st.info("Analyze a meeting first.")
     else:
-        st.write("No decisions detected.")
+        st.header("🔎 Search Transcript")
+        query = st.text_input("Search term")
+        if query:
+            results = search_transcript(data["transcript"], query)
+            st.caption(f"{len(results)} match(es) found")
+            for r in results:
+                st.markdown(f"> {r}")
 
-    # -----------------------------
-    # Action items
-    # -----------------------------
-    st.subheader("✅ Action Items")
-
-    if actions.empty:
-        st.write("No action items detected.")
+# ---------------------------------------------------------------- History
+elif page == "📜 History":
+    st.header("📜 Meeting History")
+    meetings = list_meetings()
+    if not meetings:
+        st.info("No meetings saved yet.")
     else:
-        st.dataframe(
-            actions,
-            use_container_width=True,
-            hide_index=True
-        )
+        for m in meetings:
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([3, 1, 1])
+                c1.markdown(f"**{m['title']}**  \n_{m['created_at']}_  \n{m['summary'][:150]}...")
+                if c2.button("Open", key=f"open_{m['id']}"):
+                    full = get_meeting(m["id"])
+                    st.session_state.analysis = full["data"]
+                    st.success(f"Loaded '{m['title']}'. Go to Dashboard.")
+                if c3.button("Delete", key=f"del_{m['id']}"):
+                    delete_meeting(m["id"])
+                    st.rerun()
 
-    # -----------------------------
-    # Entities
-    # -----------------------------
-    st.subheader("🏷️ Important Entities")
-
-    entity_col1, entity_col2 = st.columns(2)
-
-    with entity_col1:
-        st.write("**People**")
-        for person in entities["People"]:
-            st.write(f"• {person}")
-
-    with entity_col2:
-        st.write("**Organizations**")
-        for organization in entities["Organizations"]:
-            st.write(f"• {organization}")
-
-    st.write("**Dates / Deadlines**")
-    if dates:
-        for date in dates:
-            st.write(f"• {date}")
+# ---------------------------------------------------------------- Export
+elif page == "📤 Export":
+    data = st.session_state.analysis
+    if not data:
+        st.info("Analyze a meeting first.")
     else:
-        st.write("No dates detected.")
+        st.header("📤 Export & Translate")
 
-    # -----------------------------
-    # Classification table
-    # -----------------------------
-    with st.expander("🔍 View NLP Classification Details"):
-        st.dataframe(
-            classified_df,
-            use_container_width=True,
-            hide_index=True
-        )
+        st.subheader("Downloadable Report")
+        c1, c2 = st.columns(2)
+        with c1:
+            docx_bytes = report_to_docx_bytes(
+                data["title"], data["summary"], data["key_points"],
+                data["decisions"], data["action_items"], data["entities"],
+            )
+            st.download_button("⬇️ Download Report (DOCX)", docx_bytes,
+                                file_name=f"{data['title']}_report.docx")
+        with c2:
+            pdf_bytes = report_to_pdf_bytes(
+                data["title"], data["summary"], data["key_points"],
+                data["decisions"], data["action_items"], data["entities"],
+            )
+            st.download_button("⬇️ Download Report (PDF)", pdf_bytes,
+                                file_name=f"{data['title']}_report.pdf")
 
-    # -----------------------------
-    # Downloadable report
-    # -----------------------------
-    report = create_report(
-        summary,
-        discussions,
-        decisions,
-        actions,
-        entities,
-        dates
-    )
+        st.subheader("Export Tasks to Task-Management Systems")
+        st.caption("CSV imports directly into Trello, Asana, Jira, ClickUp and Notion. "
+                    ".ics adds deadlines to Google/Outlook/Apple Calendar.")
+        c3, c4 = st.columns(2)
+        with c3:
+            csv_bytes = action_items_to_csv_bytes(data["action_items"])
+            st.download_button("⬇️ Tasks as CSV", csv_bytes, file_name=f"{data['title']}_tasks.csv")
+        with c4:
+            ics_bytes = action_items_to_ics_bytes(data["action_items"], data["title"])
+            st.download_button("⬇️ Deadlines as Calendar (.ics)", ics_bytes,
+                                file_name=f"{data['title']}_deadlines.ics")
 
-    st.subheader("📄 Meeting Report")
-
-    st.download_button(
-        label="⬇️ Download Meeting Report",
-        data=report,
-        file_name="meeting_report.md",
-        mime="text/markdown"
-    )
-
-    st.caption(
-        "The dashboard provides visual and text-based results, while the "
-        "downloadable report provides a structured text report."
-    )
+        st.subheader("Translate Report")
+        target_lang = st.selectbox("Translate summary + action items to:", list(LANGUAGES.keys()))
+        if st.button("Translate"):
+            with st.spinner("Translating..."):
+                t_summary = translate_text(data["summary"], LANGUAGES[target_lang])
+                t_points = [translate_text(p, LANGUAGES[target_lang]) for p in data["key_points"]]
+            st.markdown(f"**Summary ({target_lang}):** {t_summary}")
+            st.markdown(f"**Key Points ({target_lang}):**")
+            for p in t_points:
+                st.markdown(f"- {p}")
