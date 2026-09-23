@@ -450,16 +450,124 @@ init_db()
 if "current_meeting_id" not in st.session_state:
     st.session_state.current_meeting_id = None
 
+# ----------------------------------------------------------------------------
+# CUSTOM STYLING
+# ----------------------------------------------------------------------------
+st.markdown("""
+<style>
+    :root {
+        --brand: #6366F1;
+        --brand-dark: #4338CA;
+        --bg-soft: #F8F9FC;
+        --border-soft: #E5E7EB;
+    }
+
+    html, body, [class*="css"] { font-family: 'Inter', 'Segoe UI', sans-serif; }
+
+    /* App background */
+    .stApp { background-color: var(--bg-soft); }
+
+    /* Sidebar */
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #ffffff 0%, #F3F4F8 100%);
+        border-right: 1px solid var(--border-soft);
+    }
+    section[data-testid="stSidebar"] h1 {
+        font-size: 1.4rem;
+        font-weight: 800;
+        color: var(--brand-dark);
+        padding-bottom: 0.2rem;
+    }
+
+    /* Headings */
+    h1, h2, h3 { color: #1F2430; font-weight: 750; }
+    h1 { letter-spacing: -0.5px; }
+
+    /* Buttons */
+    .stButton > button {
+        border-radius: 8px;
+        border: 1px solid var(--brand);
+        background-color: var(--brand);
+        color: white;
+        font-weight: 600;
+        padding: 0.5rem 1.1rem;
+        transition: all 0.15s ease-in-out;
+    }
+    .stButton > button:hover {
+        background-color: var(--brand-dark);
+        border-color: var(--brand-dark);
+        transform: translateY(-1px);
+        box-shadow: 0 4px 10px rgba(99, 102, 241, 0.25);
+    }
+    .stDownloadButton > button {
+        border-radius: 8px;
+        border: 1px solid var(--brand);
+        color: var(--brand-dark);
+        font-weight: 600;
+        background-color: white;
+    }
+    .stDownloadButton > button:hover {
+        background-color: #EEF0FF;
+    }
+
+    /* Cards: tabs, expanders, containers */
+    div[data-testid="stExpander"] {
+        border: 1px solid var(--border-soft);
+        border-radius: 10px;
+        background-color: white;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    }
+    div[data-baseweb="tab-list"] { gap: 4px; }
+    button[data-baseweb="tab"] {
+        border-radius: 8px 8px 0 0;
+        font-weight: 600;
+        color: #6B7280;
+    }
+    button[data-baseweb="tab"][aria-selected="true"] {
+        color: var(--brand-dark);
+        border-bottom: 3px solid var(--brand);
+    }
+
+    /* Metrics / dataframes */
+    div[data-testid="stMetric"] {
+        background-color: white;
+        border: 1px solid var(--border-soft);
+        border-radius: 10px;
+        padding: 0.6rem 0.9rem;
+    }
+    div[data-testid="stDataFrame"] {
+        border-radius: 10px;
+        overflow: hidden;
+        border: 1px solid var(--border-soft);
+    }
+
+    /* Text area / inputs */
+    .stTextArea textarea, .stTextInput input {
+        border-radius: 8px !important;
+        border: 1px solid var(--border-soft) !important;
+    }
+    .stTextArea textarea:focus, .stTextInput input:focus {
+        border-color: var(--brand) !important;
+        box-shadow: 0 0 0 1px var(--brand) !important;
+    }
+
+    /* Alerts */
+    div[data-testid="stAlert"] { border-radius: 10px; }
+
+    /* Hide default Streamlit chrome */
+    #MainMenu { visibility: hidden; }
+    footer { visibility: hidden; }
+</style>
+""", unsafe_allow_html=True)
+
 with st.sidebar:
     st.title("🗒️ Meeting AI")
+    st.caption("NLP-powered meeting summarizer, action-item extractor & assistant")
 
-    # Prefer a secret named GEMINI_API_KEY; fall back to letting the user
-    # paste one in at runtime so the app never hard-crashes if the secret
-    # is missing.
+    # Read the Gemini key from Streamlit secrets only. No key input is shown
+    # to the user — the app author (you) supplies it once via
+    # Manage app > Settings > Secrets as GEMINI_API_KEY = "...".
     api_key = st.secrets.get("GEMINI_API_KEY", "")
-    if not api_key:
-        api_key = st.text_input("Gemini API Key", type="password",
-                                 help="Get one free at https://aistudio.google.com/apikey")
 
     st.divider()
     page = st.radio("Navigate", ["🎙️ New Meeting", "📚 Meeting History"])
@@ -468,6 +576,14 @@ with st.sidebar:
     st.caption("Report language")
     lang_name = st.selectbox("Translate report into", list(LANGUAGES.keys()), index=0)
     lang_code = LANGUAGES[lang_name]
+
+if not api_key:
+    st.error(
+        "⚠️ No Gemini API key configured for this app. The app owner needs to "
+        "set **GEMINI_API_KEY** under *Manage app → Settings → Secrets* in "
+        "Streamlit Cloud, then reboot the app."
+    )
+    st.stop()
 
 
 def render_dashboard(meeting_id: int, title: str, transcript: str, data: dict):
@@ -558,9 +674,7 @@ def render_dashboard(meeting_id: int, title: str, transcript: str, data: dict):
         your_name = st.text_input("Your name (so 'what are MY tasks' works)", key=f"name_{meeting_id}")
         question = st.text_input("Your question", placeholder="What tasks were assigned to me?", key=f"q_{meeting_id}")
         if st.button("Ask", key=f"ask_{meeting_id}"):
-            if not api_key:
-                st.error("Add your Gemini API key in the sidebar first.")
-            elif not question:
+            if not question:
                 st.warning("Type a question first.")
             else:
                 with st.spinner("Thinking..."):
@@ -651,16 +765,13 @@ if page == "🎙️ New Meeting":
         if audio_file is not None:
             st.audio(audio_file)
             if st.button("🎧 Transcribe audio"):
-                if not api_key:
-                    st.error("Add your Gemini API key in the sidebar first.")
-                else:
-                    with st.spinner("Transcribing... (this can take a minute for longer recordings)"):
-                        with tempfile.NamedTemporaryFile(delete=False, suffix="." + audio_file.name.split(".")[-1]) as tmp:
-                            tmp.write(audio_file.read())
-                            tmp_path = tmp.name
-                        transcript_text = transcribe_audio(tmp_path, api_key)
-                    st.session_state["pending_transcript"] = transcript_text
-                    st.success("Transcription complete — review below, then click Process.")
+                with st.spinner("Transcribing... (this can take a minute for longer recordings)"):
+                    with tempfile.NamedTemporaryFile(delete=False, suffix="." + audio_file.name.split(".")[-1]) as tmp:
+                        tmp.write(audio_file.read())
+                        tmp_path = tmp.name
+                    transcript_text = transcribe_audio(tmp_path, api_key)
+                st.session_state["pending_transcript"] = transcript_text
+                st.success("Transcription complete — review below, then click Process.")
 
         transcript_text = st.session_state.get("pending_transcript")
         if transcript_text:
@@ -668,9 +779,7 @@ if page == "🎙️ New Meeting":
 
     st.divider()
     if st.button("🧠 Process Meeting", type="primary"):
-        if not api_key:
-            st.error("Add your Gemini API key in the sidebar first.")
-        elif not transcript_text or not transcript_text.strip():
+        if not transcript_text or not transcript_text.strip():
             st.warning("Provide a transcript (paste, upload, or transcribe audio) first.")
         else:
             with st.spinner("Running NLP pipeline: summarizing, extracting action items, detecting priority..."):
