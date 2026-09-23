@@ -22,7 +22,7 @@ import sqlite3
 import tempfile
 import datetime
 from pathlib import Path
-
+import streamlit as st
 import requests
 import streamlit as st
 import pandas as pd
@@ -436,12 +436,7 @@ if "current_meeting_id" not in st.session_state:
 with st.sidebar:
     st.title("🗒️ Meeting AI")
 
-    api_key = st.text_input(
-        "OpenAI API Key", type="password",
-        value=st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else "",
-        help="Used for transcription (Whisper) and text analysis (GPT). "
-             "On Streamlit Cloud, set this in Settings > Secrets as OPENAI_API_KEY instead of pasting it here.",
-    )
+    api_key = st.secrets["API_KEY"]
 
     st.divider()
     page = st.radio("Navigate", ["🎙️ New Meeting", "📚 Meeting History"])
