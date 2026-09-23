@@ -10,8 +10,13 @@ Run locally:
     streamlit run app.py
 
 Deploy: push this repo to GitHub, then deploy on https://share.streamlit.io
-pointing at app.py. Set OPENAI_API_KEY in Streamlit Cloud's
+pointing at app.py. Set GEMINI_API_KEY in Streamlit Cloud's
 Settings > Secrets, or just paste it in the sidebar at runtime.
+
+NOTE ON GEMINI: this uses Google's OpenAI-compatibility endpoint, so the
+`openai` Python package still works -- we just point it at Google's URL
+and use Gemini model names instead of GPT model names. Get a Gemini key
+(free tier available) at https://aistudio.google.com/apikey
 """
 
 import io
@@ -24,7 +29,6 @@ import datetime
 from pathlib import Path
 import streamlit as st
 import requests
-import streamlit as st
 import pandas as pd
 import plotly.express as px
 from openai import OpenAI
@@ -107,23 +111,42 @@ def delete_meeting(meeting_id: int):
 
 
 # ============================================================================
-# SECTION 2: NLP ENGINE (transcription, extraction, Q&A)
+# SECTION 2: NLP ENGINE (transcription, extraction, Q&A) — GEMINI VERSION
+# ----------------------------------------------------------------------------
+# Gemini has an OpenAI-compatible endpoint, so we keep using the `openai`
+# package but point it at Google's base_url with a Gemini API key.
+# Docs: https://ai.google.dev/gemini-api/docs/openai
 # ============================================================================
 
-EXTRACTION_MODEL = "gpt-4o-mini"
-TRANSCRIBE_MODEL = "whisper-1"
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+EXTRACTION_MODEL = "gemini-2.0-flash"
 
 
 def _client(api_key: str) -> OpenAI:
-    return OpenAI(api_key=api_key)
+    return OpenAI(api_key=api_key, base_url=GEMINI_BASE_URL)
 
 
 def transcribe_audio(file_path: str, api_key: str) -> str:
-    """Transcribe an audio file to plain text using the Whisper API."""
-    client = _client(api_key)
-    with open(file_path, "rb") as f:
-        result = client.audio.transcriptions.create(model=TRANSCRIBE_MODEL, file=f)
-    return result.text
+    """
+    Transcribe audio using Gemini directly (native SDK, not the OpenAI
+    compat layer — Gemini's audio understanding isn't exposed through the
+    OpenAI-style /audio/transcriptions endpoint the way Whisper is).
+    Requires: pip install google-genai
+    """
+    from google import genai as google_genai
+
+    client = google_genai.Client(api_key=api_key)
+    uploaded = client.files.upload(file=file_path)
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=[
+            uploaded,
+            "Transcribe this audio verbatim. If multiple speakers are "
+            "audible, label each line with a speaker name or 'Speaker 1', "
+            "'Speaker 2', etc. Return only the transcript text.",
+        ],
+    )
+    return response.text
 
 
 EXTRACTION_SCHEMA_PROMPT = """You are an assistant that extracts structured information from a meeting transcript.
@@ -172,7 +195,10 @@ def extract_meeting_info(transcript: str, api_key: str) -> dict:
         response_format={"type": "json_object"},
         temperature=0.2,
     )
-    data = json.loads(response.choices[0].message.content)
+    raw = response.choices[0].message.content
+    # Gemini sometimes wraps JSON in markdown fences even when asked not to; strip defensively.
+    raw = re.sub(r"^```json\s*|\s*```$", "", raw.strip())
+    data = json.loads(raw)
 
     data.setdefault("summary", "")
     data.setdefault("key_points", [])
@@ -220,12 +246,6 @@ Answer concisely and directly.
 
 # ============================================================================
 # SECTION 3: PDF REPORT GENERATOR
-# ----------------------------------------------------------------------------
-# Note: fpdf2's default core fonts (Helvetica) only support Latin-1 text.
-# If you translate the report into a non-Latin script first, characters
-# outside Latin-1 are replaced with '?' to avoid a crash. For full Unicode
-# PDF support, add a TTF font (e.g. DejaVuSans.ttf) and load it with
-# pdf.add_font(...) — left out here to keep the app dependency-free.
 # ============================================================================
 
 def _safe(text) -> str:
@@ -335,7 +355,6 @@ def translate_text(text: str, target_lang_code: str) -> str:
 
 
 def translate_meeting_data(data: dict, target_lang_code: str) -> dict:
-    """Translate human-readable fields; names/dates/owners are left as-is."""
     if target_lang_code == "en":
         return data
     translated = dict(data)
@@ -399,8 +418,6 @@ def action_items_to_json(action_items: list[dict]) -> bytes:
 
 
 def export_to_trello(action_items: list[dict], api_key: str, token: str, list_id: str) -> list[dict]:
-    """Push each action item as a Trello card. Needs a Trello API key + token
-    (from https://trello.com/power-ups/admin) and the target list's ID."""
     results = []
     url = "https://api.trello.com/1/cards"
     for item in action_items:
@@ -436,7 +453,13 @@ if "current_meeting_id" not in st.session_state:
 with st.sidebar:
     st.title("🗒️ Meeting AI")
 
-    api_key = st.secrets["API_KEY"]
+    # Prefer a secret named GEMINI_API_KEY; fall back to letting the user
+    # paste one in at runtime so the app never hard-crashes if the secret
+    # is missing.
+    api_key = st.secrets.get("GEMINI_API_KEY", "")
+    if not api_key:
+        api_key = st.text_input("Gemini API Key", type="password",
+                                 help="Get one free at https://aistudio.google.com/apikey")
 
     st.divider()
     page = st.radio("Navigate", ["🎙️ New Meeting", "📚 Meeting History"])
@@ -536,7 +559,7 @@ def render_dashboard(meeting_id: int, title: str, transcript: str, data: dict):
         question = st.text_input("Your question", placeholder="What tasks were assigned to me?", key=f"q_{meeting_id}")
         if st.button("Ask", key=f"ask_{meeting_id}"):
             if not api_key:
-                st.error("Add your OpenAI API key in the sidebar first.")
+                st.error("Add your Gemini API key in the sidebar first.")
             elif not question:
                 st.warning("Type a question first.")
             else:
@@ -629,7 +652,7 @@ if page == "🎙️ New Meeting":
             st.audio(audio_file)
             if st.button("🎧 Transcribe audio"):
                 if not api_key:
-                    st.error("Add your OpenAI API key in the sidebar first.")
+                    st.error("Add your Gemini API key in the sidebar first.")
                 else:
                     with st.spinner("Transcribing... (this can take a minute for longer recordings)"):
                         with tempfile.NamedTemporaryFile(delete=False, suffix="." + audio_file.name.split(".")[-1]) as tmp:
@@ -646,7 +669,7 @@ if page == "🎙️ New Meeting":
     st.divider()
     if st.button("🧠 Process Meeting", type="primary"):
         if not api_key:
-            st.error("Add your OpenAI API key in the sidebar first.")
+            st.error("Add your Gemini API key in the sidebar first.")
         elif not transcript_text or not transcript_text.strip():
             st.warning("Provide a transcript (paste, upload, or transcribe audio) first.")
         else:
