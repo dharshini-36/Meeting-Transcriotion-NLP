@@ -3,6 +3,7 @@ faster-whisper>=1.0
 pandas>=2.0
 plotly>=5.20
 deep-translator>=1.11
+deepl>=1.16  # optional — only used if you set the DEEPL_API_KEY env var
 fpdf2>=2.7
 python-docx>=1.1
 requests>=2.31
