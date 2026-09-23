@@ -6,12 +6,28 @@ points, decisions, action items (person/deadline/priority), entities,
 charts, search, Q&A, translation, PDF export, email drafts, CSV/JSON/Trello
 task export, and multi-meeting history (SQLite).
 
+This version runs FULLY LOCALLY — no OpenAI API key, no per-request cost,
+no data leaving your machine once the models are downloaded:
+    - Transcription: faster-whisper (a local Whisper implementation)
+    - Summarization / extraction / Q&A: a local LLM served by Ollama
+      (https://ollama.com)
+
+Setup (one-time):
+    1. Install Ollama: https://ollama.com/download
+    2. Pull a model, e.g.:  ollama pull llama3.1
+    3. Make sure Ollama is running (the desktop app does this automatically,
+       or run `ollama serve` yourself).
+    4. pip install -r requirements.txt
+
 Run locally:
     streamlit run app.py
 
 Deploy: push this repo to GitHub, then deploy on https://share.streamlit.io
-pointing at app.py. Set OPENAI_API_KEY in Streamlit Cloud's
-Settings > Secrets, or just paste it in the sidebar at runtime.
+pointing at app.py. NOTE: Streamlit Community Cloud can't run Ollama for
+you — this app expects to reach an Ollama server at the URL you give it in
+the sidebar, so for a hosted deployment you'd need to run Ollama somewhere
+reachable (e.g. on a VM/box you control) and point the sidebar URL at it.
+For fully local use, just run it on your own machine.
 """
 
 import io
@@ -27,7 +43,6 @@ import requests
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from openai import OpenAI
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 from deep_translator import GoogleTranslator
@@ -107,28 +122,78 @@ def delete_meeting(meeting_id: int):
 
 
 # ============================================================================
-# SECTION 2: NLP ENGINE (transcription, extraction, Q&A)
+# SECTION 2: NLP ENGINE (transcription, extraction, Q&A) — 100% LOCAL
+# ----------------------------------------------------------------------------
+#   - Transcription: faster-whisper. Model weights download once (cached
+#     under ~/.cache) the first time each size is used, then run offline.
+#   - Extraction / Q&A: a local LLM through Ollama's REST API. No API key —
+#     Ollama just needs to be installed and running on your machine (or on
+#     a box you control, if you point OLLAMA URL at a remote instance).
 # ============================================================================
 
-EXTRACTION_MODEL = "gpt-4o-mini"
-TRANSCRIBE_MODEL = "whisper-1"
+OLLAMA_DEFAULT_URL = "http://localhost:11434"
+OLLAMA_DEFAULT_MODEL = "llama3.1"
+
+_whisper_models: dict = {}  # cache loaded models by size
 
 
-def _client(api_key: str) -> OpenAI:
-    return OpenAI(api_key=api_key)
+def get_whisper_model(model_size: str = "base"):
+    if model_size not in _whisper_models:
+        from faster_whisper import WhisperModel
+        _whisper_models[model_size] = WhisperModel(model_size, device="cpu", compute_type="int8")
+    return _whisper_models[model_size]
 
 
-def transcribe_audio(file_path: str, api_key: str) -> str:
-    """Transcribe an audio file to plain text using the Whisper API."""
-    client = _client(api_key)
-    with open(file_path, "rb") as f:
-        result = client.audio.transcriptions.create(model=TRANSCRIBE_MODEL, file=f)
-    return result.text
+def transcribe_audio(file_path: str, whisper_size: str = "base") -> str:
+    """Transcribe an audio file to plain text using a local faster-whisper model."""
+    model = get_whisper_model(whisper_size)
+    segments, _info = model.transcribe(file_path)
+    return " ".join(seg.text.strip() for seg in segments).strip()
+
+
+def ollama_is_reachable(ollama_url: str) -> bool:
+    try:
+        r = requests.get(f"{ollama_url.rstrip('/')}/api/tags", timeout=3)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _ollama_generate(prompt: str, ollama_url: str, model: str, json_mode: bool = False, timeout: int = 300) -> str:
+    """Call a local Ollama server's /api/generate endpoint. No API key needed."""
+    payload = {"model": model, "prompt": prompt, "stream": False}
+    if json_mode:
+        payload["format"] = "json"
+    try:
+        resp = requests.post(f"{ollama_url.rstrip('/')}/api/generate", json=payload, timeout=timeout)
+        resp.raise_for_status()
+    except requests.exceptions.ConnectionError as e:
+        raise RuntimeError(
+            f"Couldn't reach Ollama at {ollama_url}. Is it installed and running? "
+            f"(https://ollama.com — then `ollama serve`)"
+        ) from e
+    except requests.exceptions.HTTPError as e:
+        raise RuntimeError(
+            f"Ollama returned an error for model '{model}'. Have you pulled it? "
+            f"Try: ollama pull {model}"
+        ) from e
+    return resp.json().get("response", "")
+
+
+def _extract_json(text: str) -> dict:
+    """Local models don't always obey 'return only JSON' as strictly as GPT does,
+    so pull out the first {...} block instead of assuming the whole string is JSON."""
+    text = text.strip()
+    text = re.sub(r"^```(json)?|```$", "", text, flags=re.MULTILINE).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError("No JSON object found in the model's output. Try a different/larger local model.")
+    return json.loads(text[start:end + 1])
 
 
 EXTRACTION_SCHEMA_PROMPT = """You are an assistant that extracts structured information from a meeting transcript.
 
-Read the transcript below and return ONLY a valid JSON object (no markdown fences, no commentary) with this exact shape:
+Read the transcript below and return ONLY a valid JSON object (no markdown fences, no commentary, no text before or after it) with this exact shape:
 
 {
   "summary": "2-4 sentence summary of the whole meeting",
@@ -162,17 +227,10 @@ Return ONLY the JSON object.
 """
 
 
-def extract_meeting_info(transcript: str, api_key: str) -> dict:
-    client = _client(api_key)
+def extract_meeting_info(transcript: str, ollama_url: str, model: str) -> dict:
     prompt = EXTRACTION_SCHEMA_PROMPT.replace("{transcript}", transcript[:15000])
-
-    response = client.chat.completions.create(
-        model=EXTRACTION_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
-        temperature=0.2,
-    )
-    data = json.loads(response.choices[0].message.content)
+    raw = _ollama_generate(prompt, ollama_url, model, json_mode=True)
+    data = _extract_json(raw)
 
     data.setdefault("summary", "")
     data.setdefault("key_points", [])
@@ -191,9 +249,8 @@ def extract_meeting_info(transcript: str, api_key: str) -> dict:
     return data
 
 
-def answer_question(transcript: str, extracted_data: dict, question: str, api_key: str, asking_as: str | None = None) -> str:
-    client = _client(api_key)
-
+def answer_question(transcript: str, extracted_data: dict, question: str, ollama_url: str, model: str,
+                     asking_as: str | None = None) -> str:
     context = f"""MEETING TRANSCRIPT:
 {transcript[:12000]}
 
@@ -210,12 +267,7 @@ QUESTION: {question}
 
 Answer concisely and directly.
 """
-    response = client.chat.completions.create(
-        model=EXTRACTION_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
-    )
-    return response.choices[0].message.content
+    return _ollama_generate(prompt, ollama_url, model).strip()
 
 
 # ============================================================================
@@ -435,13 +487,26 @@ if "current_meeting_id" not in st.session_state:
 
 with st.sidebar:
     st.title("🗒️ Meeting AI")
+    st.caption("Runs 100% locally — no API key, no cloud calls, no per-use cost.")
 
-    api_key = st.text_input(
-        "OpenAI API Key", type="password",
-        value=st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else "",
-        help="Used for transcription (Whisper) and text analysis (GPT). "
-             "On Streamlit Cloud, set this in Settings > Secrets as OPENAI_API_KEY instead of pasting it here.",
+    ollama_url = st.text_input(
+        "Ollama server URL", value=OLLAMA_DEFAULT_URL,
+        help="Ollama's local server. Default is fine if it's running on this machine.",
     )
+    ollama_model = st.text_input(
+        "Ollama model", value=OLLAMA_DEFAULT_MODEL,
+        help="Must already be pulled, e.g. run:  ollama pull llama3.1",
+    )
+    whisper_size = st.selectbox(
+        "Whisper model size (for audio)", ["tiny", "base", "small", "medium"], index=1,
+        help="Bigger = more accurate but slower and more RAM. Downloads once, then runs offline.",
+    )
+
+    if not ollama_is_reachable(ollama_url):
+        st.warning(
+            "Can't reach Ollama at that URL. Install it from ollama.com, make sure it's "
+            f"running, and that you've run `ollama pull {ollama_model}`."
+        )
 
     st.divider()
     page = st.radio("Navigate", ["🎙️ New Meeting", "📚 Meeting History"])
@@ -540,14 +605,16 @@ def render_dashboard(meeting_id: int, title: str, transcript: str, data: dict):
         your_name = st.text_input("Your name (so 'what are MY tasks' works)", key=f"name_{meeting_id}")
         question = st.text_input("Your question", placeholder="What tasks were assigned to me?", key=f"q_{meeting_id}")
         if st.button("Ask", key=f"ask_{meeting_id}"):
-            if not api_key:
-                st.error("Add your OpenAI API key in the sidebar first.")
-            elif not question:
+            if not question:
                 st.warning("Type a question first.")
             else:
                 with st.spinner("Thinking..."):
-                    answer = answer_question(transcript, data, question, api_key, asking_as=your_name or None)
-                st.markdown(f"**Answer:** {answer}")
+                    try:
+                        answer = answer_question(transcript, data, question, ollama_url, ollama_model,
+                                                   asking_as=your_name or None)
+                        st.markdown(f"**Answer:** {answer}")
+                    except RuntimeError as e:
+                        st.error(str(e))
 
     with tabs[5]:
         st.subheader("📤 Export & share")
@@ -633,16 +700,14 @@ if page == "🎙️ New Meeting":
         if audio_file is not None:
             st.audio(audio_file)
             if st.button("🎧 Transcribe audio"):
-                if not api_key:
-                    st.error("Add your OpenAI API key in the sidebar first.")
-                else:
-                    with st.spinner("Transcribing... (this can take a minute for longer recordings)"):
-                        with tempfile.NamedTemporaryFile(delete=False, suffix="." + audio_file.name.split(".")[-1]) as tmp:
-                            tmp.write(audio_file.read())
-                            tmp_path = tmp.name
-                        transcript_text = transcribe_audio(tmp_path, api_key)
-                    st.session_state["pending_transcript"] = transcript_text
-                    st.success("Transcription complete — review below, then click Process.")
+                with st.spinner(f"Transcribing locally with Whisper ({whisper_size})... "
+                                 f"(first run downloads the model; can take a while for long recordings)"):
+                    with tempfile.NamedTemporaryFile(delete=False, suffix="." + audio_file.name.split(".")[-1]) as tmp:
+                        tmp.write(audio_file.read())
+                        tmp_path = tmp.name
+                    transcript_text = transcribe_audio(tmp_path, whisper_size)
+                st.session_state["pending_transcript"] = transcript_text
+                st.success("Transcription complete — review below, then click Process.")
 
         transcript_text = st.session_state.get("pending_transcript")
         if transcript_text:
@@ -650,18 +715,23 @@ if page == "🎙️ New Meeting":
 
     st.divider()
     if st.button("🧠 Process Meeting", type="primary"):
-        if not api_key:
-            st.error("Add your OpenAI API key in the sidebar first.")
-        elif not transcript_text or not transcript_text.strip():
+        if not transcript_text or not transcript_text.strip():
             st.warning("Provide a transcript (paste, upload, or transcribe audio) first.")
         else:
-            with st.spinner("Running NLP pipeline: summarizing, extracting action items, detecting priority..."):
-                data = extract_meeting_info(transcript_text, api_key)
-                meeting_id = save_meeting(meeting_title, transcript_text, data)
-            st.session_state.current_meeting_id = meeting_id
-            st.session_state.pop("pending_transcript", None)
-            st.success("Done! Dashboard below.")
-            st.rerun()
+            with st.spinner(f"Running local NLP pipeline with '{ollama_model}': summarizing, "
+                             f"extracting action items, detecting priority..."):
+                try:
+                    data = extract_meeting_info(transcript_text, ollama_url, ollama_model)
+                    meeting_id = save_meeting(meeting_title, transcript_text, data)
+                    st.session_state.current_meeting_id = meeting_id
+                    st.session_state.pop("pending_transcript", None)
+                    st.success("Done! Dashboard below.")
+                    st.rerun()
+                except RuntimeError as e:
+                    st.error(str(e))
+                except (ValueError, json.JSONDecodeError) as e:
+                    st.error(f"Couldn't parse the model's response as JSON: {e}. "
+                              f"Try a different/larger Ollama model (e.g. llama3.1 or mistral).")
 
     if st.session_state.current_meeting_id:
         meeting = get_meeting(st.session_state.current_meeting_id)
