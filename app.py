@@ -1,303 +1,692 @@
+"""
+Meeting-to-Action-Items AI  —  single-file Streamlit app.
+
+Upload a meeting AUDIO file OR a TRANSCRIPT and get: summary, key discussion
+points, decisions, action items (person/deadline/priority), entities,
+charts, search, Q&A, translation, PDF export, email drafts, CSV/JSON/Trello
+task export, and multi-meeting history (SQLite).
+
+Run locally:
+    streamlit run app.py
+
+Deploy: push this repo to GitHub, then deploy on https://share.streamlit.io
+pointing at app.py. Set OPENAI_API_KEY in Streamlit Cloud's
+Settings > Secrets, or just paste it in the sidebar at runtime.
+"""
+
+import io
+import re
+import csv
+import json
+import sqlite3
+import tempfile
+import datetime
+from pathlib import Path
+
+import requests
 import streamlit as st
 import pandas as pd
-import matplotlib.pyplot as plt
-import datetime
+import plotly.express as px
+from openai import OpenAI
+from fpdf import FPDF
+from fpdf.enums import XPos, YPos
+from deep_translator import GoogleTranslator
 
-from src.nlp_pipeline import (
-    clean_transcript, extract_entities, summarize_text,
-    extract_key_points, extract_decisions, extract_action_items,
-)
-from src.priority import annotate_priorities
-from src.speaker import parse_speakers, build_speaker_char_map, plain_transcript
-from src.qa_engine import answer_question, search_transcript
-from src.translator import translate_text, LANGUAGES
-from src.database import save_meeting, list_meetings, get_meeting, delete_meeting
-from src.export_utils import (
-    action_items_to_csv_bytes, action_items_to_ics_bytes,
-    report_to_docx_bytes, report_to_pdf_bytes,
-)
-from src.email_generator import generate_all_drafts
 
-st.set_page_config(page_title="Meeting-to-Action-Items AI", page_icon="🎤", layout="wide")
+# ============================================================================
+# SECTION 1: DATABASE (meeting history, SQLite)
+# ----------------------------------------------------------------------------
+# NOTE on Streamlit Community Cloud: the filesystem there is EPHEMERAL — it
+# resets on redeploy/sleep. This SQLite file is fine for demos and a single
+# active session. For real persistence, swap this for hosted Postgres
+# (e.g. Supabase/Railway) — only this section would need to change.
+# ============================================================================
 
-# ---------------------------------------------------------------- session state
-if "analysis" not in st.session_state:
-    st.session_state.analysis = None
-if "user_name" not in st.session_state:
-    st.session_state.user_name = ""
+DB_PATH = Path(__file__).parent / "meetings.db"
 
-# ---------------------------------------------------------------- sidebar
-with st.sidebar:
-    st.title("🎤 Meeting AI")
-    st.caption("NLP-powered meeting summarizer & task extractor")
-    st.session_state.user_name = st.text_input(
-        "Your name (for 'my tasks' Q&A)", value=st.session_state.user_name
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS meetings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            created_at TEXT,
+            transcript TEXT,
+            data_json TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def save_meeting(title: str, transcript: str, data: dict) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute(
+        "INSERT INTO meetings (title, created_at, transcript, data_json) VALUES (?, ?, ?, ?)",
+        (title, datetime.datetime.now().isoformat(timespec="seconds"), transcript, json.dumps(data)),
     )
-    page = st.radio(
-        "Navigate",
-        ["🆕 New Meeting", "📊 Dashboard", "❓ Ask Questions", "🔎 Search",
-         "📜 History", "📤 Export"],
+    conn.commit()
+    meeting_id = cur.lastrowid
+    conn.close()
+    return meeting_id
+
+
+def update_meeting_data(meeting_id: int, data: dict):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE meetings SET data_json = ? WHERE id = ?", (json.dumps(data), meeting_id))
+    conn.commit()
+    conn.close()
+
+
+def get_all_meetings() -> list[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT id, title, created_at FROM meetings ORDER BY id DESC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_meeting(meeting_id: int) -> dict | None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    result = dict(row)
+    result["data"] = json.loads(result.pop("data_json"))
+    return result
+
+
+def delete_meeting(meeting_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
+    conn.commit()
+    conn.close()
+
+
+# ============================================================================
+# SECTION 2: NLP ENGINE (transcription, extraction, Q&A)
+# ============================================================================
+
+EXTRACTION_MODEL = "gpt-4o-mini"
+TRANSCRIBE_MODEL = "whisper-1"
+
+
+def _client(api_key: str) -> OpenAI:
+    return OpenAI(api_key=api_key)
+
+
+def transcribe_audio(file_path: str, api_key: str) -> str:
+    """Transcribe an audio file to plain text using the Whisper API."""
+    client = _client(api_key)
+    with open(file_path, "rb") as f:
+        result = client.audio.transcriptions.create(model=TRANSCRIBE_MODEL, file=f)
+    return result.text
+
+
+EXTRACTION_SCHEMA_PROMPT = """You are an assistant that extracts structured information from a meeting transcript.
+
+Read the transcript below and return ONLY a valid JSON object (no markdown fences, no commentary) with this exact shape:
+
+{
+  "summary": "2-4 sentence summary of the whole meeting",
+  "key_points": ["short discussion point", "..."],
+  "decisions": ["decision made", "..."],
+  "action_items": [
+    {"task": "...", "person": "name or 'Unassigned'", "deadline": "date or 'Not specified'", "priority": "High" | "Medium" | "Low"}
+  ],
+  "entities": {
+    "people": ["..."],
+    "organizations": ["..."],
+    "dates": ["..."],
+    "projects": ["..."],
+    "technologies": ["..."]
+  }
+}
+
+Rules for priority:
+- High: urgent, blocking, or explicitly said to be urgent/critical/ASAP, or due very soon
+- Medium: normal work item with a deadline
+- Low: nice-to-have, no urgency, no near deadline
+
+If the transcript has speaker labels like "Alice: ..." use those names for "person" and "people". If no names are given, use "Unassigned" and infer roles where possible.
+
+Transcript:
+---
+{transcript}
+---
+
+Return ONLY the JSON object.
+"""
+
+
+def extract_meeting_info(transcript: str, api_key: str) -> dict:
+    client = _client(api_key)
+    prompt = EXTRACTION_SCHEMA_PROMPT.replace("{transcript}", transcript[:15000])
+
+    response = client.chat.completions.create(
+        model=EXTRACTION_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        response_format={"type": "json_object"},
+        temperature=0.2,
     )
-    st.divider()
-    st.caption("Built with spaCy NER + DistilBART summarization + "
-               "zero-shot DistilBERT priority classification.")
+    data = json.loads(response.choices[0].message.content)
 
+    data.setdefault("summary", "")
+    data.setdefault("key_points", [])
+    data.setdefault("decisions", [])
+    data.setdefault("action_items", [])
+    data.setdefault("entities", {})
+    for key in ("people", "organizations", "dates", "projects", "technologies"):
+        data["entities"].setdefault(key, [])
 
-def run_pipeline(transcript_raw: str, meeting_title: str):
-    transcript_raw = clean_transcript(transcript_raw)
-    segments, speaker_counts = parse_speakers(transcript_raw)
-    char_map = build_speaker_char_map(segments)
-    plain_text = plain_transcript(segments) if segments else transcript_raw
+    for item in data["action_items"]:
+        item.setdefault("status", "Pending")
+        item.setdefault("priority", "Medium")
+        item.setdefault("person", "Unassigned")
+        item.setdefault("deadline", "Not specified")
 
-    with st.spinner("Summarizing meeting..."):
-        summary = summarize_text(plain_text)
-    with st.spinner("Extracting entities..."):
-        entities = extract_entities(plain_text)
-    with st.spinner("Identifying key discussion points..."):
-        key_points = extract_key_points(plain_text)
-    with st.spinner("Detecting decisions..."):
-        decisions = extract_decisions(plain_text)
-    with st.spinner("Extracting action items..."):
-        action_items = extract_action_items(plain_text, speaker_map=char_map)
-    with st.spinner("Scoring priority..."):
-        action_items = annotate_priorities(action_items)
-    for item in action_items:
-        item["status"] = "Pending"
-
-    data = {
-        "title": meeting_title,
-        "transcript": transcript_raw,
-        "plain_text": plain_text,
-        "summary": summary,
-        "entities": entities,
-        "key_points": key_points,
-        "decisions": decisions,
-        "action_items": action_items,
-        "speaker_counts": speaker_counts,
-    }
-    st.session_state.analysis = data
-    save_meeting(meeting_title, transcript_raw, summary, data)
     return data
 
 
-# ---------------------------------------------------------------- New Meeting
-if page == "🆕 New Meeting":
-    st.header("New Meeting")
-    meeting_title = st.text_input("Meeting title", value=f"Meeting {datetime.date.today()}")
+def answer_question(transcript: str, extracted_data: dict, question: str, api_key: str, asking_as: str | None = None) -> str:
+    client = _client(api_key)
 
-    input_mode = st.radio("Input type", ["📄 Paste / upload transcript", "🎧 Upload audio"], horizontal=True)
+    context = f"""MEETING TRANSCRIPT:
+{transcript[:12000]}
 
-    transcript_text = ""
-    if input_mode == "📄 Paste / upload transcript":
-        uploaded = st.file_uploader("Upload a .txt transcript (optional)", type=["txt"])
-        if uploaded:
-            transcript_text = uploaded.read().decode("utf-8", errors="ignore")
-        transcript_text = st.text_area(
-            "Or paste transcript here (tip: prefix lines with 'Name: ' for speaker identification)",
-            value=transcript_text, height=280,
-            placeholder="Dharshini: I'll fix the login bug by Friday.\nPriya: I'll prepare test cases by Thursday.\n...",
+STRUCTURED DATA ALREADY EXTRACTED (summary/decisions/action items):
+{json.dumps(extracted_data, indent=2)[:4000]}
+"""
+    who = f'\nThe person asking is named "{asking_as}". If the question refers to "me"/"my", treat it as referring to this person.' if asking_as else ""
+
+    prompt = f"""You are a meeting assistant. Answer the user's question using ONLY the information in the context below. If the answer isn't in the context, say so honestly — do not make anything up.{who}
+
+{context}
+
+QUESTION: {question}
+
+Answer concisely and directly.
+"""
+    response = client.chat.completions.create(
+        model=EXTRACTION_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+    )
+    return response.choices[0].message.content
+
+
+# ============================================================================
+# SECTION 3: PDF REPORT GENERATOR
+# ----------------------------------------------------------------------------
+# Note: fpdf2's default core fonts (Helvetica) only support Latin-1 text.
+# If you translate the report into a non-Latin script first, characters
+# outside Latin-1 are replaced with '?' to avoid a crash. For full Unicode
+# PDF support, add a TTF font (e.g. DejaVuSans.ttf) and load it with
+# pdf.add_font(...) — left out here to keep the app dependency-free.
+# ============================================================================
+
+def _safe(text) -> str:
+    if text is None:
+        return ""
+    return str(text).encode("latin-1", "replace").decode("latin-1")
+
+
+class MeetingPDF(FPDF):
+    def header(self):
+        self.set_font("Helvetica", "B", 16)
+        self.cell(0, 10, _safe(self.title_text), new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+        self.set_font("Helvetica", "", 9)
+        self.set_text_color(120, 120, 120)
+        self.cell(0, 6, _safe(f"Generated {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"),
+                  new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+        self.set_text_color(0, 0, 0)
+        self.ln(4)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font("Helvetica", "I", 8)
+        self.cell(0, 10, f"Page {self.page_no()}", align="C")
+
+    def section_title(self, text):
+        self.set_font("Helvetica", "B", 13)
+        self.set_fill_color(235, 235, 245)
+        self.cell(0, 9, _safe(text), new_x=XPos.LMARGIN, new_y=YPos.NEXT, fill=True)
+        self.ln(2)
+
+    def body_text(self, text):
+        self.set_font("Helvetica", "", 11)
+        self.multi_cell(0, 6, _safe(text), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        self.ln(2)
+
+    def bullet_list(self, items):
+        self.set_font("Helvetica", "", 11)
+        for item in items:
+            self.multi_cell(0, 6, _safe(f"- {item}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        self.ln(2)
+
+
+def generate_pdf(meeting_title: str, data: dict) -> bytes:
+    pdf = MeetingPDF()
+    pdf.title_text = meeting_title
+    pdf.add_page()
+
+    pdf.section_title("Meeting Summary")
+    pdf.body_text(data.get("summary", "N/A"))
+
+    pdf.section_title("Key Discussion Points")
+    pdf.bullet_list(data.get("key_points", []) or ["None recorded"])
+
+    pdf.section_title("Decisions Made")
+    pdf.bullet_list(data.get("decisions", []) or ["None recorded"])
+
+    pdf.section_title("Action Items")
+    pdf.set_font("Helvetica", "B", 10)
+    col_widths = [70, 35, 30, 25, 25]
+    headers = ["Task", "Person", "Deadline", "Priority", "Status"]
+    for w, h in zip(col_widths, headers):
+        pdf.cell(w, 8, _safe(h), border=1, new_x=XPos.RIGHT, new_y=YPos.TOP)
+    pdf.ln()
+    pdf.set_font("Helvetica", "", 9)
+    for item in data.get("action_items", []):
+        pdf.cell(col_widths[0], 8, _safe(item.get("task", ""))[:45], border=1, new_x=XPos.RIGHT, new_y=YPos.TOP)
+        pdf.cell(col_widths[1], 8, _safe(item.get("person", ""))[:20], border=1, new_x=XPos.RIGHT, new_y=YPos.TOP)
+        pdf.cell(col_widths[2], 8, _safe(item.get("deadline", ""))[:15], border=1, new_x=XPos.RIGHT, new_y=YPos.TOP)
+        pdf.cell(col_widths[3], 8, _safe(item.get("priority", ""))[:12], border=1, new_x=XPos.RIGHT, new_y=YPos.TOP)
+        pdf.cell(col_widths[4], 8, _safe(item.get("status", ""))[:12], border=1, new_x=XPos.RIGHT, new_y=YPos.TOP)
+        pdf.ln()
+    pdf.ln(4)
+
+    pdf.section_title("Important Entities")
+    entities = data.get("entities", {})
+    for label, key in [("People", "people"), ("Organizations", "organizations"),
+                        ("Dates", "dates"), ("Projects", "projects"), ("Technologies", "technologies")]:
+        values = entities.get(key, [])
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 7, _safe(f"{label}:"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.multi_cell(0, 6, _safe(", ".join(values) if values else "None found"),
+                       new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(1)
+
+    return bytes(pdf.output())
+
+
+# ============================================================================
+# SECTION 4: TRANSLATION (free, via deep-translator / Google Translate)
+# ============================================================================
+
+LANGUAGES = {
+    "English": "en", "Hindi": "hi", "Tamil": "ta", "Telugu": "te",
+    "Kannada": "kn", "Malayalam": "ml", "French": "fr", "German": "de",
+    "Spanish": "es", "Chinese (Simplified)": "zh-CN", "Japanese": "ja", "Arabic": "ar",
+}
+_CHUNK_SIZE = 4500
+
+
+def translate_text(text: str, target_lang_code: str) -> str:
+    if not text or target_lang_code == "en":
+        return text
+    translator = GoogleTranslator(source="auto", target=target_lang_code)
+    chunks = [text[i:i + _CHUNK_SIZE] for i in range(0, len(text), _CHUNK_SIZE)]
+    return " ".join(translator.translate(chunk) for chunk in chunks)
+
+
+def translate_meeting_data(data: dict, target_lang_code: str) -> dict:
+    """Translate human-readable fields; names/dates/owners are left as-is."""
+    if target_lang_code == "en":
+        return data
+    translated = dict(data)
+    translated["summary"] = translate_text(data.get("summary", ""), target_lang_code)
+    translated["key_points"] = [translate_text(p, target_lang_code) for p in data.get("key_points", [])]
+    translated["decisions"] = [translate_text(d, target_lang_code) for d in data.get("decisions", [])]
+    translated["action_items"] = [
+        {**item, "task": translate_text(item.get("task", ""), target_lang_code)}
+        for item in data.get("action_items", [])
+    ]
+    return translated
+
+
+# ============================================================================
+# SECTION 5: EXPORTERS (email drafts, CSV/JSON, Trello)
+# ============================================================================
+
+EMAIL_TEMPLATE = """Subject: Action Item: {task}
+
+Hi {person},
+
+Following today's meeting ("{meeting_title}"), you've been assigned the following task:
+
+  Task: {task}
+  Deadline: {deadline}
+  Priority: {priority}
+
+Please let me know if you have any questions or need help prioritizing this
+against your other work.
+
+Thanks,
+Meeting-to-Action-Items AI
+"""
+
+
+def generate_email_drafts(meeting_title: str, action_items: list[dict]) -> list[dict]:
+    drafts = []
+    for item in action_items:
+        body = EMAIL_TEMPLATE.format(
+            task=item.get("task", ""), person=item.get("person", "Team"),
+            deadline=item.get("deadline", "Not specified"), priority=item.get("priority", "Medium"),
+            meeting_title=meeting_title,
         )
-    else:
-        audio_file = st.file_uploader("Upload audio (wav/mp3/m4a)", type=["wav", "mp3", "m4a"])
-        st.caption("Uses a free online speech-to-text service - best for short, clear recordings.")
-        if audio_file and st.button("Transcribe audio"):
-            from src.speech_to_text import audio_file_to_wav, transcribe_wav
-            with st.spinner("Converting and transcribing audio... this can take a while."):
-                wav_path = audio_file_to_wav(audio_file)
-                transcript_text = transcribe_wav(wav_path)
-            st.success("Transcription complete - review/edit below before analyzing.")
-        transcript_text = st.text_area("Transcript (from audio)", value=transcript_text, height=280)
+        drafts.append({"person": item.get("person", "Unassigned"),
+                        "subject": f"Action Item: {item.get('task','')}", "body": body})
+    return drafts
 
-    if st.button("🧠 Analyze Meeting", type="primary", disabled=not transcript_text.strip()):
-        run_pipeline(transcript_text, meeting_title)
-        st.success("Analysis complete! Head to the Dashboard tab.")
 
-# ---------------------------------------------------------------- Dashboard
-elif page == "📊 Dashboard":
-    data = st.session_state.analysis
-    if not data:
-        st.info("No meeting analyzed yet. Go to **New Meeting** first, or load one from **History**.")
-    else:
-        st.header(f"📊 Dashboard — {data['title']}")
+def action_items_to_csv(action_items: list[dict]) -> bytes:
+    output = io.StringIO()
+    fieldnames = ["task", "person", "deadline", "priority", "status"]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for item in action_items:
+        writer.writerow({k: item.get(k, "") for k in fieldnames})
+    return output.getvalue().encode("utf-8")
 
-        st.subheader("📋 Meeting Summary")
-        st.write(data["summary"])
 
+def action_items_to_json(action_items: list[dict]) -> bytes:
+    return json.dumps(action_items, indent=2).encode("utf-8")
+
+
+def export_to_trello(action_items: list[dict], api_key: str, token: str, list_id: str) -> list[dict]:
+    """Push each action item as a Trello card. Needs a Trello API key + token
+    (from https://trello.com/power-ups/admin) and the target list's ID."""
+    results = []
+    url = "https://api.trello.com/1/cards"
+    for item in action_items:
+        params = {
+            "key": api_key, "token": token, "idList": list_id,
+            "name": item.get("task", "Untitled task"),
+            "desc": f"Assigned to: {item.get('person','Unassigned')}\nPriority: {item.get('priority','Medium')}",
+        }
+        deadline = item.get("deadline")
+        if deadline and deadline.lower() != "not specified":
+            params["due"] = deadline
+        try:
+            resp = requests.post(url, params=params, timeout=10)
+            if resp.status_code in (200, 201):
+                results.append({"task": item.get("task"), "status": "success"})
+            else:
+                results.append({"task": item.get("task"), "status": "failed", "error": resp.text[:200]})
+        except Exception as e:
+            results.append({"task": item.get("task"), "status": "failed", "error": str(e)})
+    return results
+
+
+# ============================================================================
+# SECTION 6: STREAMLIT UI
+# ============================================================================
+
+st.set_page_config(page_title="Meeting-to-Action-Items AI", page_icon="🗒️", layout="wide")
+init_db()
+
+if "current_meeting_id" not in st.session_state:
+    st.session_state.current_meeting_id = None
+
+with st.sidebar:
+    st.title("🗒️ Meeting AI")
+
+    api_key = st.text_input(
+        "OpenAI API Key", type="password",
+        value=st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else "",
+        help="Used for transcription (Whisper) and text analysis (GPT). "
+             "On Streamlit Cloud, set this in Settings > Secrets as OPENAI_API_KEY instead of pasting it here.",
+    )
+
+    st.divider()
+    page = st.radio("Navigate", ["🎙️ New Meeting", "📚 Meeting History"])
+
+    st.divider()
+    st.caption("Report language")
+    lang_name = st.selectbox("Translate report into", list(LANGUAGES.keys()), index=0)
+    lang_code = LANGUAGES[lang_name]
+
+
+def render_dashboard(meeting_id: int, title: str, transcript: str, data: dict):
+    tabs = st.tabs(["📋 Overview", "✅ Action Items", "📊 Charts & Entities",
+                     "🔍 Search", "💬 Ask Questions", "📤 Export"])
+
+    with tabs[0]:
+        st.subheader("Meeting Summary")
+        st.write(data.get("summary", "N/A"))
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("💬 Key Discussion Points")
-            for p in data["key_points"]:
-                st.markdown(f"- {p}")
+            for point in data.get("key_points", []):
+                st.markdown(f"- {point}")
         with col2:
             st.subheader("🎯 Decisions Made")
-            if data["decisions"]:
-                for d in data["decisions"]:
-                    st.markdown(f"- {d}")
-            else:
-                st.caption("No explicit decisions detected.")
+            for dec in data.get("decisions", []):
+                st.markdown(f"- {dec}")
 
+    with tabs[1]:
         st.subheader("✅ Action Items")
-        df = pd.DataFrame(data["action_items"])
-        if not df.empty:
+        items = data.get("action_items", [])
+        if items:
+            df = pd.DataFrame(items)
             edited = st.data_editor(
-                df[["person", "task", "deadline", "priority", "status"]],
+                df,
                 column_config={
-                    "status": st.column_config.SelectboxColumn(
-                        options=["Pending", "In Progress", "Completed"]
-                    ),
-                    "priority": st.column_config.SelectboxColumn(
-                        options=["High", "Medium", "Low"]
-                    ),
+                    "priority": st.column_config.SelectboxColumn(options=["High", "Medium", "Low"]),
+                    "status": st.column_config.SelectboxColumn(options=["Pending", "In Progress", "Completed"]),
                 },
-                num_rows="dynamic", use_container_width=True, key="editor",
+                num_rows="dynamic", use_container_width=True, key=f"editor_{meeting_id}",
             )
-            # persist edits back into session state
-            data["action_items"] = edited.to_dict("records")
+            if st.button("💾 Save changes", key=f"save_{meeting_id}"):
+                data["action_items"] = edited.to_dict(orient="records")
+                update_meeting_data(meeting_id, data)
+                st.success("Saved.")
+                st.rerun()
         else:
-            st.caption("No action items detected.")
+            st.info("No action items were extracted from this meeting.")
+
+    with tabs[2]:
+        items = data.get("action_items", [])
+        if items:
+            df = pd.DataFrame(items)
+            c1, c2 = st.columns(2)
+            with c1:
+                by_person = df.groupby("person").size().reset_index(name="count")
+                st.plotly_chart(px.bar(by_person, x="person", y="count", title="📊 Action Items by Person"),
+                                 use_container_width=True)
+            with c2:
+                by_status = df.groupby("status").size().reset_index(name="count")
+                st.plotly_chart(px.pie(by_status, names="status", values="count", title="📈 Task Status"),
+                                 use_container_width=True)
+            by_priority = df.groupby("priority").size().reset_index(name="count")
+            fig3 = px.bar(by_priority, x="priority", y="count", title="🚦 Priority Breakdown",
+                          category_orders={"priority": ["High", "Medium", "Low"]}, color="priority",
+                          color_discrete_map={"High": "#e74c3c", "Medium": "#f1c40f", "Low": "#2ecc71"})
+            st.plotly_chart(fig3, use_container_width=True)
+        else:
+            st.info("No action items to chart yet.")
 
         st.subheader("🏷️ Important Entities")
-        e1, e2, e3, e4 = st.columns(4)
-        e1.metric("People", len(data["entities"]["people"]))
-        e2.metric("Organizations", len(data["entities"]["organizations"]))
-        e3.metric("Dates", len(data["entities"]["dates"]))
-        e4.metric("Projects/Tech", len(data["entities"]["projects_tech"]))
-        with st.expander("View entity details"):
-            st.json(data["entities"])
+        entities = data.get("entities", {})
+        ec1, ec2, ec3 = st.columns(3)
+        with ec1:
+            st.markdown("**People**"); st.write(", ".join(entities.get("people", [])) or "—")
+            st.markdown("**Organizations**"); st.write(", ".join(entities.get("organizations", [])) or "—")
+        with ec2:
+            st.markdown("**Dates**"); st.write(", ".join(entities.get("dates", [])) or "—")
+            st.markdown("**Projects**"); st.write(", ".join(entities.get("projects", [])) or "—")
+        with ec3:
+            st.markdown("**Technologies**"); st.write(", ".join(entities.get("technologies", [])) or "—")
 
-        st.subheader("📈 Visual Insights")
-        v1, v2 = st.columns(2)
-        with v1:
-            if data["action_items"]:
-                counts = pd.Series([i["person"] for i in data["action_items"]]).value_counts()
-                fig, ax = plt.subplots()
-                counts.plot(kind="barh", ax=ax, color="#4F46E5")
-                ax.set_xlabel("Number of tasks")
-                ax.set_title("Action Items by Person")
-                st.pyplot(fig)
-        with v2:
-            if data["action_items"]:
-                status_counts = pd.Series([i.get("status", "Pending") for i in data["action_items"]]).value_counts()
-                fig2, ax2 = plt.subplots()
-                ax2.pie(status_counts, labels=status_counts.index, autopct="%1.0f%%",
-                        colors=["#F59E0B", "#3B82F6", "#10B981"])
-                ax2.set_title("Task Status")
-                st.pyplot(fig2)
-
-        if data["speaker_counts"] and len(data["speaker_counts"]) > 1:
-            st.subheader("🎙️ Speaker Participation")
-            sp_df = pd.Series(data["speaker_counts"]).sort_values(ascending=False)
-            st.bar_chart(sp_df)
-
-        st.subheader("📅 Upcoming Deadlines")
-        deadline_df = pd.DataFrame(
-            [i for i in data["action_items"] if i["deadline"] != "Not specified"]
-        )
-        if not deadline_df.empty:
-            st.dataframe(deadline_df[["person", "task", "deadline"]], use_container_width=True)
-        else:
-            st.caption("No explicit deadlines detected.")
-
-        st.subheader("📧 Generated Email Drafts")
-        drafts = generate_all_drafts(data["action_items"], data["title"])
-        if drafts:
-            for d in drafts:
-                with st.expander(f"✉️ To: {d['to']} — {d['subject']}"):
-                    st.text(d["body"])
-        else:
-            st.caption("No assigned-person action items to draft emails for yet.")
-
-# ---------------------------------------------------------------- Ask Questions
-elif page == "❓ Ask Questions":
-    data = st.session_state.analysis
-    if not data:
-        st.info("Analyze a meeting first.")
-    else:
-        st.header("❓ Ask About This Meeting")
-        st.caption('Try: "What tasks were assigned to me?" or "What did we decide about the homepage?"')
-        q = st.text_input("Your question")
-        if st.button("Ask", type="primary", disabled=not q.strip()):
-            with st.spinner("Thinking..."):
-                answer = answer_question(q, data["plain_text"], data["action_items"], st.session_state.user_name)
-            st.markdown(f"**Answer:** {answer}")
-
-# ---------------------------------------------------------------- Search
-elif page == "🔎 Search":
-    data = st.session_state.analysis
-    if not data:
-        st.info("Analyze a meeting first.")
-    else:
-        st.header("🔎 Search Transcript")
-        query = st.text_input("Search term")
+    with tabs[3]:
+        st.subheader("🔍 Search within transcript")
+        query = st.text_input("Search term", key=f"search_{meeting_id}")
         if query:
-            results = search_transcript(data["transcript"], query)
-            st.caption(f"{len(results)} match(es) found")
-            for r in results:
-                st.markdown(f"> {r}")
+            lines = re.split(r"(?<=[.!?])\s+|\n", transcript)
+            matches = [l for l in lines if query.lower() in l.lower()]
+            st.caption(f"{len(matches)} match(es)")
+            for m in matches:
+                st.markdown(f"> {re.sub(f'(?i)({re.escape(query)})', r'**\\1**', m)}")
+        with st.expander("View full transcript"):
+            st.text_area("Transcript", transcript, height=300, key=f"full_transcript_{meeting_id}")
 
-# ---------------------------------------------------------------- History
-elif page == "📜 History":
-    st.header("📜 Meeting History")
-    meetings = list_meetings()
-    if not meetings:
-        st.info("No meetings saved yet.")
-    else:
-        for m in meetings:
-            with st.container(border=True):
-                c1, c2, c3 = st.columns([3, 1, 1])
-                c1.markdown(f"**{m['title']}**  \n_{m['created_at']}_  \n{m['summary'][:150]}...")
-                if c2.button("Open", key=f"open_{m['id']}"):
-                    full = get_meeting(m["id"])
-                    st.session_state.analysis = full["data"]
-                    st.success(f"Loaded '{m['title']}'. Go to Dashboard.")
-                if c3.button("Delete", key=f"del_{m['id']}"):
-                    delete_meeting(m["id"])
-                    st.rerun()
+    with tabs[4]:
+        st.subheader("💬 Ask questions about this meeting")
+        your_name = st.text_input("Your name (so 'what are MY tasks' works)", key=f"name_{meeting_id}")
+        question = st.text_input("Your question", placeholder="What tasks were assigned to me?", key=f"q_{meeting_id}")
+        if st.button("Ask", key=f"ask_{meeting_id}"):
+            if not api_key:
+                st.error("Add your OpenAI API key in the sidebar first.")
+            elif not question:
+                st.warning("Type a question first.")
+            else:
+                with st.spinner("Thinking..."):
+                    answer = answer_question(transcript, data, question, api_key, asking_as=your_name or None)
+                st.markdown(f"**Answer:** {answer}")
 
-# ---------------------------------------------------------------- Export
-elif page == "📤 Export":
-    data = st.session_state.analysis
-    if not data:
-        st.info("Analyze a meeting first.")
-    else:
-        st.header("📤 Export & Translate")
+    with tabs[5]:
+        st.subheader("📤 Export & share")
 
-        st.subheader("Downloadable Report")
+        st.markdown(f"**Translate report to {lang_name}**")
+        if st.button("🌐 Translate report", key=f"translate_{meeting_id}"):
+            with st.spinner(f"Translating into {lang_name}..."):
+                st.session_state[f"translated_{meeting_id}"] = translate_meeting_data(data, lang_code)
+            st.success("Translated below (does not overwrite your saved English data).")
+
+        translated_data = st.session_state.get(f"translated_{meeting_id}")
+        export_data = translated_data if translated_data else data
+        if translated_data:
+            st.info(f"Showing/exporting the {lang_name} version.")
+            st.write(export_data.get("summary", ""))
+
+        st.divider()
+        pdf_bytes = generate_pdf(title, export_data)
+        st.download_button("⬇️ Download PDF Report", data=pdf_bytes,
+                            file_name=f"{title.replace(' ', '_')}_report.pdf", mime="application/pdf")
+
+        items = export_data.get("action_items", [])
         c1, c2 = st.columns(2)
         with c1:
-            docx_bytes = report_to_docx_bytes(
-                data["title"], data["summary"], data["key_points"],
-                data["decisions"], data["action_items"], data["entities"],
-            )
-            st.download_button("⬇️ Download Report (DOCX)", docx_bytes,
-                                file_name=f"{data['title']}_report.docx")
+            st.download_button("⬇️ Export tasks as CSV", data=action_items_to_csv(items),
+                                file_name="action_items.csv", mime="text/csv")
         with c2:
-            pdf_bytes = report_to_pdf_bytes(
-                data["title"], data["summary"], data["key_points"],
-                data["decisions"], data["action_items"], data["entities"],
-            )
-            st.download_button("⬇️ Download Report (PDF)", pdf_bytes,
-                                file_name=f"{data['title']}_report.pdf")
+            st.download_button("⬇️ Export tasks as JSON", data=action_items_to_json(items),
+                                file_name="action_items.json", mime="application/json")
 
-        st.subheader("Export Tasks to Task-Management Systems")
-        st.caption("CSV imports directly into Trello, Asana, Jira, ClickUp and Notion. "
-                    ".ics adds deadlines to Google/Outlook/Apple Calendar.")
-        c3, c4 = st.columns(2)
-        with c3:
-            csv_bytes = action_items_to_csv_bytes(data["action_items"])
-            st.download_button("⬇️ Tasks as CSV", csv_bytes, file_name=f"{data['title']}_tasks.csv")
-        with c4:
-            ics_bytes = action_items_to_ics_bytes(data["action_items"], data["title"])
-            st.download_button("⬇️ Deadlines as Calendar (.ics)", ics_bytes,
-                                file_name=f"{data['title']}_deadlines.ics")
+        st.divider()
+        st.markdown("**✉️ Email drafts (one per action item)**")
+        for d in generate_email_drafts(title, items):
+            with st.expander(f"To: {d['person']} — {d['subject']}"):
+                st.code(d["body"])
 
-        st.subheader("Translate Report")
-        target_lang = st.selectbox("Translate summary + action items to:", list(LANGUAGES.keys()))
-        if st.button("Translate"):
-            with st.spinner("Translating..."):
-                t_summary = translate_text(data["summary"], LANGUAGES[target_lang])
-                t_points = [translate_text(p, LANGUAGES[target_lang]) for p in data["key_points"]]
-            st.markdown(f"**Summary ({target_lang}):** {t_summary}")
-            st.markdown(f"**Key Points ({target_lang}):**")
-            for p in t_points:
-                st.markdown(f"- {p}")
+        st.divider()
+        st.markdown("**🔗 Export tasks to Trello**")
+        with st.expander("Trello integration"):
+            st.caption("Get your key/token from https://trello.com/power-ups/admin, and the target list's ID from the Trello API.")
+            t_key = st.text_input("Trello API Key", key=f"trello_key_{meeting_id}")
+            t_token = st.text_input("Trello Token", type="password", key=f"trello_token_{meeting_id}")
+            t_list = st.text_input("Trello List ID", key=f"trello_list_{meeting_id}")
+            if st.button("Push tasks to Trello", key=f"trello_btn_{meeting_id}"):
+                if not (t_key and t_token and t_list):
+                    st.warning("Fill in all three Trello fields first.")
+                else:
+                    with st.spinner("Pushing cards to Trello..."):
+                        results = export_to_trello(items, t_key, t_token, t_list)
+                    for r in results:
+                        if r["status"] == "success":
+                            st.success(f"✅ {r['task']}")
+                        else:
+                            st.error(f"❌ {r['task']}: {r.get('error')}")
+
+
+# ---- Page: New Meeting ----
+if page == "🎙️ New Meeting":
+    st.header("🎙️ New Meeting")
+    meeting_title = st.text_input("Meeting title", value="Untitled Meeting")
+    input_mode = st.radio("Input type", ["📄 Transcript text", "🎤 Audio file"], horizontal=True)
+
+    transcript_text = None
+
+    if input_mode == "📄 Transcript text":
+        st.caption("Tip: if your transcript has speaker labels like `Alice: ...` on each line, "
+                    "the AI will use those names for action items.")
+        upload = st.file_uploader("Upload a .txt or .docx transcript (optional)", type=["txt", "docx"])
+        pasted = st.text_area("...or paste the transcript here", height=200)
+
+        if upload is not None:
+            if upload.name.endswith(".docx"):
+                from docx import Document
+                doc = Document(upload)
+                transcript_text = "\n".join(p.text for p in doc.paragraphs)
+            else:
+                transcript_text = upload.read().decode("utf-8", errors="ignore")
+        elif pasted.strip():
+            transcript_text = pasted
+
+    else:
+        audio_file = st.file_uploader("Upload meeting audio", type=["mp3", "wav", "m4a", "mp4"])
+        if audio_file is not None:
+            st.audio(audio_file)
+            if st.button("🎧 Transcribe audio"):
+                if not api_key:
+                    st.error("Add your OpenAI API key in the sidebar first.")
+                else:
+                    with st.spinner("Transcribing... (this can take a minute for longer recordings)"):
+                        with tempfile.NamedTemporaryFile(delete=False, suffix="." + audio_file.name.split(".")[-1]) as tmp:
+                            tmp.write(audio_file.read())
+                            tmp_path = tmp.name
+                        transcript_text = transcribe_audio(tmp_path, api_key)
+                    st.session_state["pending_transcript"] = transcript_text
+                    st.success("Transcription complete — review below, then click Process.")
+
+        transcript_text = st.session_state.get("pending_transcript")
+        if transcript_text:
+            transcript_text = st.text_area("Transcribed text (edit if needed)", transcript_text, height=200)
+
+    st.divider()
+    if st.button("🧠 Process Meeting", type="primary"):
+        if not api_key:
+            st.error("Add your OpenAI API key in the sidebar first.")
+        elif not transcript_text or not transcript_text.strip():
+            st.warning("Provide a transcript (paste, upload, or transcribe audio) first.")
+        else:
+            with st.spinner("Running NLP pipeline: summarizing, extracting action items, detecting priority..."):
+                data = extract_meeting_info(transcript_text, api_key)
+                meeting_id = save_meeting(meeting_title, transcript_text, data)
+            st.session_state.current_meeting_id = meeting_id
+            st.session_state.pop("pending_transcript", None)
+            st.success("Done! Dashboard below.")
+            st.rerun()
+
+    if st.session_state.current_meeting_id:
+        meeting = get_meeting(st.session_state.current_meeting_id)
+        if meeting:
+            st.divider()
+            st.header(f"📊 Dashboard — {meeting['title']}")
+            render_dashboard(meeting["id"], meeting["title"], meeting["transcript"], meeting["data"])
+
+# ---- Page: Meeting History ----
+else:
+    st.header("📚 Meeting History")
+    meetings = get_all_meetings()
+    if not meetings:
+        st.info("No meetings processed yet. Go to 'New Meeting' to get started.")
+    else:
+        labels = [f"#{m['id']} — {m['title']} ({m['created_at']})" for m in meetings]
+        selected = st.selectbox("Select a past meeting", labels)
+        selected_id = meetings[labels.index(selected)]["id"]
+
+        col1, col2 = st.columns([5, 1])
+        with col2:
+            if st.button("🗑️ Delete this meeting"):
+                delete_meeting(selected_id)
+                st.rerun()
+
+        meeting = get_meeting(selected_id)
+        if meeting:
+            render_dashboard(meeting["id"], meeting["title"], meeting["transcript"], meeting["data"])
