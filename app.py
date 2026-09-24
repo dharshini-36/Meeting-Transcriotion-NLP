@@ -83,8 +83,32 @@ def load_spacy():
 
 @st.cache_resource(show_spinner=False)
 def load_summarizer():
-    """Lightweight distilled BART summarizer (~300MB, deploy-friendly)."""
-    return pipeline("summarization", model="sshleifer/distilbart-cnn-6-6")
+    """
+    Lightweight distilled BART summarizer (~300MB, deploy-friendly).
+    Loaded directly via AutoTokenizer/AutoModelForSeq2SeqLM + .generate()
+    instead of pipeline("summarization", ...) -- that shortcut was removed
+    in transformers v5, so calling it directly works on BOTH v4 and v5
+    regardless of which one ends up installed.
+    """
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+    model_name = "sshleifer/distilbart-cnn-6-6"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    return tokenizer, model
+
+
+def _run_summarizer(text: str, max_len: int, min_len: int) -> str:
+    tokenizer, model = load_summarizer()
+    inputs = tokenizer([text], max_length=1024, truncation=True, return_tensors="pt")
+    summary_ids = model.generate(
+        inputs["input_ids"],
+        max_length=max_len,
+        min_length=min_len,
+        num_beams=4,
+        length_penalty=2.0,
+        early_stopping=True,
+    )
+    return tokenizer.decode(summary_ids[0], skip_special_tokens=True).strip()
 
 
 @st.cache_resource(show_spinner=False)
@@ -138,7 +162,6 @@ def summarize_text(text: str, max_len: int = 130, min_len: int = 30) -> str:
     if len(text.split()) < 40:
         return text.strip()
 
-    summarizer = load_summarizer()
     words = text.split()
     chunk_size = 700  # tokens-ish safety margin for distilbart
     chunks = [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
@@ -146,8 +169,7 @@ def summarize_text(text: str, max_len: int = 130, min_len: int = 30) -> str:
     partial_summaries = []
     for chunk in chunks:
         try:
-            out = summarizer(chunk, max_length=max_len, min_length=min_len, do_sample=False)
-            partial_summaries.append(out[0]["summary_text"].strip())
+            partial_summaries.append(_run_summarizer(chunk, max_len, min_len))
         except Exception:
             partial_summaries.append(chunk[:300])
 
@@ -155,8 +177,7 @@ def summarize_text(text: str, max_len: int = 130, min_len: int = 30) -> str:
         return partial_summaries[0]
 
     combined = " ".join(partial_summaries)
-    final = summarizer(combined, max_length=max_len, min_length=min_len, do_sample=False)
-    return final[0]["summary_text"].strip()
+    return _run_summarizer(combined, max_len, min_len)
 
 
 def extract_key_points(text: str, top_n: int = 6) -> list:
