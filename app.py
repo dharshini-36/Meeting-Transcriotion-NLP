@@ -4,7 +4,6 @@ Meeting-to-Action-Items AI — single-file Streamlit app (NO API KEY NEEDED).
 Everything runs on free, local, open-source NLP models:
   - spaCy            -> Named Entity Recognition (people, orgs, dates)
   - DistilBART        -> abstractive summarization
-  - DistilBERT (MNLI) -> zero-shot priority classification (High/Med/Low)
   - DistilBERT-SQuAD  -> extractive question answering
   - deep-translator    -> free translation (Google Translate web endpoint)
 
@@ -14,7 +13,7 @@ and are cached, so subsequent loads are fast.
 Run locally:
     streamlit run app.py
 
-Deploy: push this single file + requirements.txt (+ packages.txt for audio)
+Deploy: push this single file + requirements.txt + packages.txt
 to a GitHub repo, then connect it on https://share.streamlit.io with
 main file path = app.py. No secrets need to be configured.
 """
@@ -27,7 +26,6 @@ import sqlite3
 import tempfile
 import datetime
 import os
-from pathlib import Path
 from collections import defaultdict
 
 import streamlit as st
@@ -38,12 +36,9 @@ from transformers import pipeline
 from deep_translator import GoogleTranslator
 from docx import Document
 from fpdf import FPDF
-from icalendar import Calendar, Event
 
 # ============================================================================
-
 # SECTION 1: NLP PIPELINE (NER, summarization, action/decision extraction)
-
 # ============================================================================
 
 ACTION_VERBS = {
@@ -73,16 +68,15 @@ TECH_KEYWORDS = {
 @st.cache_resource(show_spinner=False)
 def load_spacy():
     """
-    Load the spaCy NER model. This must already be installed as a pip
-    package via requirements.txt (see the wheel URL there) -- Streamlit
+    Load the spaCy NER model. It must already be installed as a pip
+    package via requirements.txt (see the wheel URL there) — Streamlit
     Cloud's environment is read-only at runtime, so attempting to
-    spacy.cli.download() it here (as a fallback) would fail with a
-    'Permission denied' error and silently crash the app. If loading
-    fails, that means requirements.txt is missing the model wheel.
+    spacy.cli.download() it here as a fallback would fail with a
+    'Permission denied' error and silently crash the app.
     """
     try:
         return spacy.load("en_core_web_sm")
-    except OSError as e:
+    except OSError:
         st.error(
             "The spaCy language model 'en_core_web_sm' isn't installed. "
             "Add this line to requirements.txt and redeploy:\n\n"
@@ -97,9 +91,8 @@ def load_summarizer():
     """
     Lightweight distilled BART summarizer (~300MB, deploy-friendly).
     Loaded directly via AutoTokenizer/AutoModelForSeq2SeqLM + .generate()
-    instead of pipeline("summarization", ...) -- that shortcut was removed
-    in transformers v5, so calling it directly works on BOTH v4 and v5
-    regardless of which one ends up installed.
+    instead of pipeline("summarization", ...) so it works whether
+    transformers v4 or v5 ends up installed.
     """
     from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
     model_name = "sshleifer/distilbart-cnn-6-6"
@@ -122,15 +115,6 @@ def _run_summarizer(text: str, max_len: int, min_len: int) -> str:
     return tokenizer.decode(summary_ids[0], skip_special_tokens=True).strip()
 
 
-@st.cache_resource(show_spinner=False)
-def load_zero_shot():
-    """Zero-shot classifier (DistilBERT-MNLI) used for priority + topic tagging."""
-    return pipeline(
-        "zero-shot-classification",
-        model="typeform/distilbert-base-uncased-mnli",
-    )
-
-
 def clean_transcript(text: str) -> str:
     text = re.sub(r"\r\n", "\n", text)
     text = re.sub(r"[ \t]+", " ", text)
@@ -144,7 +128,6 @@ def split_sentences(text: str, nlp=None):
 
 
 def extract_entities(text: str) -> dict:
-    """Return grouped entities: People, Organizations, Dates, Projects/Tech."""
     nlp = load_spacy()
     doc = nlp(text)
 
@@ -169,12 +152,11 @@ def extract_entities(text: str) -> dict:
 
 
 def summarize_text(text: str, max_len: int = 130, min_len: int = 30) -> str:
-    """Summarize transcript. Chunks long transcripts to respect model limits."""
     if len(text.split()) < 40:
         return text.strip()
 
     words = text.split()
-    chunk_size = 700  # tokens-ish safety margin for distilbart
+    chunk_size = 700
     chunks = [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
 
     partial_summaries = []
@@ -192,8 +174,6 @@ def summarize_text(text: str, max_len: int = 130, min_len: int = 30) -> str:
 
 
 def extract_key_points(text: str, top_n: int = 6) -> list:
-    """Simple extractive key-point picker: scores sentences by entity density
-    and keyword overlap, no heavy model needed."""
     nlp = load_spacy()
     doc = nlp(text)
     sentences = [s for s in doc.sents if len(s.text.split()) > 4]
@@ -226,16 +206,6 @@ def extract_decisions(text: str) -> list:
 
 
 def extract_action_items(text: str, speaker_map: dict = None) -> list:
-    """
-    Extract action items as structured dicts:
-    {person, task, deadline, raw_sentence, priority(optional, filled later)}
-
-    Strategy:
-    1. Split into sentences.
-    2. Keep sentences containing an action cue OR an action verb.
-    3. Within each candidate sentence, find PERSON entities (fallback to
-       speaker of that line if speaker_map provided) and DATE entities.
-    """
     nlp = load_spacy()
     doc = nlp(text)
     items = []
@@ -270,46 +240,25 @@ def extract_action_items(text: str, speaker_map: dict = None) -> list:
 
 
 # ============================================================================
-
-# SECTION 2: PRIORITY DETECTION (zero-shot DistilBERT)
-
+# SECTION 2: PRIORITY DETECTION (keyword-based, fast & deploy-friendly)
 # ============================================================================
-
-LABELS = ["high priority", "medium priority", "low priority"]
 
 URGENT_WORDS = {"urgent", "asap", "immediately", "critical", "blocker", "today", "tomorrow"}
 LOW_WORDS = {"eventually", "whenever", "someday", "nice to have", "low priority"}
 
 
-def _keyword_fallback(task_text: str) -> str:
+def detect_priority(task_text: str) -> str:
+    # Keyword-based on purpose: Streamlit Community Cloud's free tier
+    # (~1GB RAM) can't reliably hold the summarizer model AND a separate
+    # zero-shot classifier in memory at once — that combo was causing
+    # silent out-of-memory crashes mid-analysis. This is fast, needs no
+    # extra model/memory, and is accurate enough for clear urgency cues.
     t = task_text.lower()
     if any(w in t for w in URGENT_WORDS):
         return "High"
     if any(w in t for w in LOW_WORDS):
         return "Low"
     return "Medium"
-
-
-def detect_priority(task_text: str) -> str:
-    # NOTE: zero-shot DistilBERT priority scoring is disabled here on purpose.
-    # Streamlit Community Cloud's free tier (~1GB RAM) can't reliably hold
-    # the summarizer model AND the zero-shot model in memory at the same
-    # time -- doing so was causing silent out-of-memory crashes mid-analysis
-    # (no error page, the run just stops). The keyword-based fallback below
-    # is fast, needs no extra model/memory, and is accurate enough for
-    # obvious urgency cues ("urgent", "asap", "today", etc). If you deploy
-    # this on a machine with more RAM, you can restore zero-shot scoring by
-    # uncommenting the block below.
-    return _keyword_fallback(task_text)
-
-    # --- higher-accuracy version (needs more RAM than free-tier Streamlit Cloud) ---
-    # try:
-    #     classifier = load_zero_shot()
-    #     result = classifier(task_text, candidate_labels=LABELS)
-    #     top_label = result["labels"][0]
-    #     return top_label.replace(" priority", "").capitalize()
-    # except Exception:
-    #     return _keyword_fallback(task_text)
 
 
 def annotate_priorities(action_items: list) -> list:
@@ -319,9 +268,7 @@ def annotate_priorities(action_items: list) -> list:
 
 
 # ============================================================================
-
 # SECTION 3: SPEAKER IDENTIFICATION (label parsing)
-
 # ============================================================================
 
 SPEAKER_PATTERN = re.compile(
@@ -330,11 +277,6 @@ SPEAKER_PATTERN = re.compile(
 
 
 def parse_speakers(transcript: str):
-    """
-    Returns:
-        segments: list of {speaker, text, char_start}
-        speaker_counts: dict speaker -> number of turns
-    """
     segments = []
     speaker_counts = {}
     char_cursor = 0
@@ -365,21 +307,15 @@ def parse_speakers(transcript: str):
 
 
 def build_speaker_char_map(segments):
-    """Maps character offsets to speaker so nlp_pipeline can attribute
-    an action item sentence to whoever's line it fell in, when no PERSON
-    entity is detected within the sentence itself."""
     return {seg["char_start"]: seg["speaker"] for seg in segments}
 
 
 def plain_transcript(segments):
-    """Strip speaker labels, return continuous text for NLP models."""
     return " ".join(seg["text"] for seg in segments)
 
 
 # ============================================================================
-
 # SECTION 4: Q&A + SEARCH
-
 # ============================================================================
 
 MY_TASK_PATTERNS = [
@@ -453,9 +389,6 @@ def answer_question(
     q_lower = question.lower()
     decisions = decisions or []
 
-    # "What did we decide/agree...?" -> answer from the already-extracted
-    # decisions list directly, instead of asking an extractive QA model to
-    # find a literal answer span for what's really an open-ended question.
     if any(re.search(p, q_lower) for p in DECISION_QUESTION_PATTERNS):
         matches = _best_matches(question, decisions)
         if matches:
@@ -464,12 +397,9 @@ def answer_question(
             return "Here's everything that was decided in this meeting:\n\n" + "\n".join(f"- {d}" for d in decisions)
         return "I didn't detect any explicit decisions in this meeting."
 
-    # "Summarize this" / "what was the meeting about" -> just return the summary.
     if any(re.search(p, q_lower) for p in SUMMARY_QUESTION_PATTERNS) and summary:
         return summary
 
-    # Otherwise fall through to the extractive QA model, best for factoid
-    # questions ("who is fixing the bug?", "when is the deadline?").
     try:
         qa = load_qa_model()
         result = qa(question=question, context=transcript)
@@ -483,7 +413,6 @@ def answer_question(
 
 
 def search_transcript(transcript: str, query: str, context_chars: int = 60) -> list:
-    """Case-insensitive search, returns list of highlighted snippets."""
     if not query.strip():
         return []
 
@@ -500,9 +429,7 @@ def search_transcript(transcript: str, query: str, context_chars: int = 60) -> l
 
 
 # ============================================================================
-
 # SECTION 5: TRANSLATION
-
 # ============================================================================
 
 LANGUAGES = {
@@ -517,7 +444,6 @@ def translate_text(text: str, target_lang_code: str, source_lang_code: str = "au
     if not text.strip():
         return ""
     try:
-        # deep-translator has a ~5000 char limit per call; chunk long reports.
         chunks = [text[i:i + 4500] for i in range(0, len(text), 4500)]
         translated_chunks = [
             GoogleTranslator(source=source_lang_code, target=target_lang_code).translate(c)
@@ -529,9 +455,7 @@ def translate_text(text: str, target_lang_code: str, source_lang_code: str = "au
 
 
 # ============================================================================
-
 # SECTION 6: DATABASE (meeting history, SQLite)
-
 # ============================================================================
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "meetings.db")
@@ -604,9 +528,8 @@ def delete_meeting(meeting_id: int):
 
 
 # ============================================================================
-
-# SECTION 7: EXPORT UTILITIES (CSV, ICS, DOCX, PDF)
-
+# SECTION 7: EXPORT UTILITIES (CSV, DOCX, PDF)
+#   NOTE: calendar (.ics) export was removed on request.
 # ============================================================================
 
 def action_items_to_csv_bytes(action_items: list) -> bytes:
@@ -616,24 +539,6 @@ def action_items_to_csv_bytes(action_items: list) -> bytes:
     buf = io.StringIO()
     df.to_csv(buf, index=False, quoting=csv.QUOTE_MINIMAL)
     return buf.getvalue().encode("utf-8")
-
-
-def action_items_to_ics_bytes(action_items: list, meeting_title: str) -> bytes:
-    cal = Calendar()
-    cal.add("prodid", "-//Meeting-to-Action-Items AI//")
-    cal.add("version", "2.0")
-
-    today = datetime.date.today()
-    for item in action_items:
-        event = Event()
-        event.add("summary", f"[{meeting_title}] {item.get('task', '')[:80]}")
-        event.add("description", f"Assigned to: {item.get('person', 'Unassigned')}\nPriority: {item.get('priority', 'N/A')}")
-        # deadline is often free text (e.g. "Friday"); fall back to +3 days if unparseable
-        event.add("dtstart", today + datetime.timedelta(days=3))
-        event.add("dtstamp", datetime.datetime.now())
-        cal.add_component(event)
-
-    return cal.to_ical()
 
 
 def report_to_docx_bytes(meeting_title, summary, key_points, decisions, action_items, entities) -> bytes:
@@ -682,11 +587,11 @@ def report_to_pdf_bytes(meeting_title, summary, key_points, decisions, action_it
     def clean(t):
         t = str(t).encode("latin-1", "replace").decode("latin-1")
         # fpdf2's line-wrapper crashes (FPDFException) if it hits a single
-        # "word" (no whitespace) that's too wide to fit the page width --
-        # e.g. a run-on token from an imperfect model-generated summary.
-        # Force-insert soft breaks into any very long unbroken run so
-        # wrapping always succeeds instead of raising.
-        return re.sub(r"\S{40,}", lambda m: " ".join(m.group(0)[i:i+40] for i in range(0, len(m.group(0)), 40)), t)
+        # "word" (no whitespace) too wide for the page width — e.g. a
+        # run-on token from an imperfect model-generated summary. Force
+        # soft breaks into any very long unbroken run so wrapping always
+        # succeeds instead of raising.
+        return re.sub(r"\S{40,}", lambda m: " ".join(m.group(0)[i:i + 40] for i in range(0, len(m.group(0)), 40)), t)
 
     pdf.set_font("Helvetica", "B", 16)
     pdf.multi_cell(0, 10, clean(f"Meeting Report: {meeting_title}"))
@@ -729,9 +634,7 @@ def report_to_pdf_bytes(meeting_title, summary, key_points, decisions, action_it
 
 
 # ============================================================================
-
 # SECTION 8: EMAIL DRAFT GENERATION
-
 # ============================================================================
 
 def group_items_by_person(action_items: list) -> dict:
@@ -760,26 +663,8 @@ def generate_all_drafts(action_items: list, meeting_title: str) -> list:
     ]
 
 
-def send_email_smtp(smtp_host, smtp_port, smtp_user, smtp_password, to_email, subject, body):
-    """Optional real send, only called if the user configures SMTP secrets."""
-    import smtplib
-    from email.mime.text import MIMEText
-
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = smtp_user
-    msg["To"] = to_email
-
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        server.starttls()
-        server.login(smtp_user, smtp_password)
-        server.sendmail(smtp_user, [to_email], msg.as_string())
-
-
 # ============================================================================
-
 # SECTION 9: OPTIONAL AUDIO TRANSCRIPTION (free, online STT)
-
 # ============================================================================
 
 try:
@@ -791,7 +676,6 @@ except ImportError:
 
 
 def audio_file_to_wav(uploaded_file) -> str:
-    """Convert any uploaded audio (mp3/m4a/wav) to a temp wav file path."""
     suffix = os.path.splitext(uploaded_file.name)[1].lower()
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_in:
         tmp_in.write(uploaded_file.read())
@@ -805,7 +689,6 @@ def audio_file_to_wav(uploaded_file) -> str:
 
 
 def transcribe_wav(wav_path: str, chunk_seconds: int = 55) -> str:
-    """Transcribe a wav file in chunks (Google's free endpoint caps length)."""
     recognizer = sr.Recognizer()
     audio = AudioSegment.from_wav(wav_path)
     duration_ms = len(audio)
@@ -834,9 +717,7 @@ def transcribe_wav(wav_path: str, chunk_seconds: int = 55) -> str:
 
 
 # ============================================================================
-
 # SECTION 10: STREAMLIT UI
-
 # ============================================================================
 
 st.set_page_config(page_title="Meeting-to-Action-Items AI", page_icon="🎤", layout="wide")
@@ -844,6 +725,15 @@ st.set_page_config(page_title="Meeting-to-Action-Items AI", page_icon="🎤", la
 # ---------------------------------------------------------------- session state
 if "analysis" not in st.session_state:
     st.session_state.analysis = None
+
+# THE FIX: both input modes now write into ONE session_state-backed key
+# ("current_transcript") instead of a plain local variable. A local
+# variable resets to "" on every script rerun (Streamlit reruns the
+# whole script on every click), which is what was wiping the
+# transcribed audio text the moment "Analyze Meeting" was clicked.
+# session_state persists across reruns, so this survives.
+if "current_transcript" not in st.session_state:
+    st.session_state.current_transcript = ""
 
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
@@ -855,7 +745,7 @@ with st.sidebar:
     )
     st.divider()
     st.caption("Built with spaCy NER + DistilBART summarization + "
-               "zero-shot DistilBERT priority classification.")
+               "keyword-based priority detection.")
 
 
 def run_pipeline(transcript_raw: str, meeting_title: str):
@@ -902,14 +792,19 @@ if page == "🆕 New Meeting":
 
     input_mode = st.radio("Input type", ["📄 Paste / upload transcript", "🎧 Upload audio"], horizontal=True)
 
-    transcript_text = ""
     if input_mode == "📄 Paste / upload transcript":
         uploaded = st.file_uploader("Upload a .txt transcript (optional)", type=["txt"])
         if uploaded:
-            transcript_text = uploaded.read().decode("utf-8", errors="ignore")
-        transcript_text = st.text_area(
+            # a freshly uploaded file overwrites whatever was there before
+            st.session_state.current_transcript = uploaded.read().decode("utf-8", errors="ignore")
+
+        # key=... binds this box directly to session_state["current_transcript"];
+        # no `value=` needed (and none should be passed alongside a key,
+        # to avoid the "default value AND Session State" warning).
+        st.text_area(
             "Or paste transcript here (tip: prefix lines with 'Name: ' for speaker identification)",
-            value=transcript_text, height=280,
+            height=280,
+            key="current_transcript",
             placeholder="Dharshini: I'll fix the login bug by Friday.\nPriya: I'll prepare test cases by Thursday.\n...",
         )
     else:
@@ -920,9 +815,16 @@ if page == "🆕 New Meeting":
         elif audio_file and st.button("Transcribe audio"):
             with st.spinner("Converting and transcribing audio... this can take a while."):
                 wav_path = audio_file_to_wav(audio_file)
-                transcript_text = transcribe_wav(wav_path)
+                st.session_state.current_transcript = transcribe_wav(wav_path)
             st.success("Transcription complete - review/edit below before analyzing.")
-        transcript_text = st.text_area("Transcript (from audio)", value=transcript_text, height=280)
+
+        st.text_area(
+            "Transcript (from audio)",
+            height=280,
+            key="current_transcript",
+        )
+
+    transcript_text = st.session_state.current_transcript
 
     if st.button("🧠 Analyze Meeting", type="primary", disabled=not transcript_text.strip()):
         run_pipeline(transcript_text, meeting_title)
@@ -967,7 +869,6 @@ elif page == "📊 Dashboard":
                 },
                 num_rows="dynamic", use_container_width=True, key="editor",
             )
-            # persist edits back into session state
             data["action_items"] = edited.to_dict("records")
         else:
             st.caption("No action items detected.")
@@ -1074,16 +975,9 @@ elif page == "📤 Export":
                 st.error(f"Couldn't generate the PDF report: {e}")
 
         st.subheader("Export Tasks to Task-Management Systems")
-        st.caption("CSV imports directly into Trello, Asana, Jira, ClickUp and Notion. "
-                    ".ics adds deadlines to Google/Outlook/Apple Calendar.")
-        c3, c4 = st.columns(2)
-        with c3:
-            csv_bytes = action_items_to_csv_bytes(data["action_items"])
-            st.download_button("⬇️ Tasks as CSV", csv_bytes, file_name=f"{data['title']}_tasks.csv")
-        with c4:
-            ics_bytes = action_items_to_ics_bytes(data["action_items"], data["title"])
-            st.download_button("⬇️ Deadlines as Calendar (.ics)", ics_bytes,
-                                file_name=f"{data['title']}_deadlines.ics")
+        st.caption("CSV imports directly into Trello, Asana, Jira, ClickUp and Notion.")
+        csv_bytes = action_items_to_csv_bytes(data["action_items"])
+        st.download_button("⬇️ Tasks as CSV", csv_bytes, file_name=f"{data['title']}_tasks.csv")
 
         st.subheader("Translate Report")
         target_lang = st.selectbox("Translate summary + action items to:", list(LANGUAGES.keys()))
