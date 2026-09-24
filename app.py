@@ -72,13 +72,24 @@ TECH_KEYWORDS = {
 
 @st.cache_resource(show_spinner=False)
 def load_spacy():
-    """Load spaCy NER model. Falls back to blank model + downloads if missing."""
+    """
+    Load the spaCy NER model. This must already be installed as a pip
+    package via requirements.txt (see the wheel URL there) -- Streamlit
+    Cloud's environment is read-only at runtime, so attempting to
+    spacy.cli.download() it here (as a fallback) would fail with a
+    'Permission denied' error and silently crash the app. If loading
+    fails, that means requirements.txt is missing the model wheel.
+    """
     try:
         return spacy.load("en_core_web_sm")
-    except OSError:
-        from spacy.cli import download
-        download("en_core_web_sm")
-        return spacy.load("en_core_web_sm")
+    except OSError as e:
+        st.error(
+            "The spaCy language model 'en_core_web_sm' isn't installed. "
+            "Add this line to requirements.txt and redeploy:\n\n"
+            "https://github.com/explosion/spacy-models/releases/download/"
+            "en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl"
+        )
+        st.stop()
 
 
 @st.cache_resource(show_spinner=False)
