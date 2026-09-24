@@ -12,4 +12,3 @@ python-docx
 fpdf2
 SpeechRecognition
 pydub
-icalendar
