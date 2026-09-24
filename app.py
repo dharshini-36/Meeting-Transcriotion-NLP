@@ -387,6 +387,21 @@ MY_TASK_PATTERNS = [
     r"what.?s my", r"tasks for me",
 ]
 
+DECISION_QUESTION_PATTERNS = [
+    r"\bdecide[ds]?\b", r"\bdecision[s]?\b", r"\bagreed?\b", r"\bconclu(ded|sion)\b",
+]
+
+SUMMARY_QUESTION_PATTERNS = [
+    r"\bsummar(y|ize|ise)\b", r"\bwhat happened\b", r"\bwhat was the meeting about\b",
+    r"\boverview\b", r"\bwhat was discussed\b",
+]
+
+QUESTION_STOPWORDS = {
+    "what", "did", "the", "was", "were", "about", "that", "this", "have", "has",
+    "does", "do", "who", "when", "where", "why", "how", "for", "and", "are",
+    "decide", "decided", "decision", "agreed", "you", "we", "they", "with",
+}
+
 
 @st.cache_resource(show_spinner=False)
 def load_qa_model():
@@ -415,10 +430,46 @@ def answer_my_tasks(action_items: list, user_name: str) -> str:
     return "\n".join(lines)
 
 
-def answer_question(question: str, transcript: str, action_items: list, user_name: str = "") -> str:
+def _keyword_overlap(question: str, sentence: str) -> int:
+    q_words = set(re.findall(r"[a-zA-Z]{3,}", question.lower())) - QUESTION_STOPWORDS
+    s_words = set(re.findall(r"[a-zA-Z]{3,}", sentence.lower()))
+    return len(q_words & s_words)
+
+
+def _best_matches(question: str, items: list, min_overlap: int = 1, top_n: int = 3) -> list:
+    scored = [(_keyword_overlap(question, s), s) for s in items]
+    scored = [x for x in scored if x[0] >= min_overlap]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [s for _, s in scored[:top_n]]
+
+
+def answer_question(
+    question: str, transcript: str, action_items: list, user_name: str = "",
+    decisions: list = None, summary: str = None,
+) -> str:
     if is_my_tasks_question(question):
         return answer_my_tasks(action_items, user_name)
 
+    q_lower = question.lower()
+    decisions = decisions or []
+
+    # "What did we decide/agree...?" -> answer from the already-extracted
+    # decisions list directly, instead of asking an extractive QA model to
+    # find a literal answer span for what's really an open-ended question.
+    if any(re.search(p, q_lower) for p in DECISION_QUESTION_PATTERNS):
+        matches = _best_matches(question, decisions)
+        if matches:
+            return "Here's what was decided:\n\n" + "\n".join(f"- {m}" for m in matches)
+        if decisions:
+            return "Here's everything that was decided in this meeting:\n\n" + "\n".join(f"- {d}" for d in decisions)
+        return "I didn't detect any explicit decisions in this meeting."
+
+    # "Summarize this" / "what was the meeting about" -> just return the summary.
+    if any(re.search(p, q_lower) for p in SUMMARY_QUESTION_PATTERNS) and summary:
+        return summary
+
+    # Otherwise fall through to the extractive QA model, best for factoid
+    # questions ("who is fixing the bug?", "when is the deadline?").
     try:
         qa = load_qa_model()
         result = qa(question=question, context=transcript)
@@ -983,7 +1034,10 @@ elif page == "❓ Ask Questions":
         q = st.text_input("Your question")
         if st.button("Ask", type="primary", disabled=not q.strip()):
             with st.spinner("Thinking..."):
-                answer = answer_question(q, data["plain_text"], data["action_items"], st.session_state.user_name)
+                answer = answer_question(
+                    q, data["plain_text"], data["action_items"], st.session_state.user_name,
+                    decisions=data["decisions"], summary=data["summary"],
+                )
             st.markdown(f"**Answer:** {answer}")
 
 # ---------------------------------------------------------------- Search
