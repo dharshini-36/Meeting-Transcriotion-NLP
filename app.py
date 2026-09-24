@@ -680,7 +680,13 @@ def report_to_pdf_bytes(meeting_title, summary, key_points, decisions, action_it
     pdf.set_auto_page_break(auto=True, margin=15)
 
     def clean(t):
-        return str(t).encode("latin-1", "replace").decode("latin-1")
+        t = str(t).encode("latin-1", "replace").decode("latin-1")
+        # fpdf2's line-wrapper crashes (FPDFException) if it hits a single
+        # "word" (no whitespace) that's too wide to fit the page width --
+        # e.g. a run-on token from an imperfect model-generated summary.
+        # Force-insert soft breaks into any very long unbroken run so
+        # wrapping always succeeds instead of raising.
+        return re.sub(r"\S{40,}", lambda m: " ".join(m.group(0)[i:i+40] for i in range(0, len(m.group(0)), 40)), t)
 
     pdf.set_font("Helvetica", "B", 16)
     pdf.multi_cell(0, 10, clean(f"Meeting Report: {meeting_title}"))
@@ -838,20 +844,14 @@ st.set_page_config(page_title="Meeting-to-Action-Items AI", page_icon="🎤", la
 # ---------------------------------------------------------------- session state
 if "analysis" not in st.session_state:
     st.session_state.analysis = None
-if "user_name" not in st.session_state:
-    st.session_state.user_name = ""
 
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
     st.title("🎤 Meeting AI")
     st.caption("NLP-powered meeting summarizer & task extractor")
-    st.session_state.user_name = st.text_input(
-        "Your name (for 'my tasks' Q&A)", value=st.session_state.user_name
-    )
     page = st.radio(
         "Navigate",
-        ["🆕 New Meeting", "📊 Dashboard", "❓ Ask Questions", "🔎 Search",
-         "📜 History", "📤 Export"],
+        ["🆕 New Meeting", "📊 Dashboard", "📜 History", "📤 Export"],
     )
     st.divider()
     st.caption("Built with spaCy NER + DistilBART summarization + "
@@ -1023,37 +1023,6 @@ elif page == "📊 Dashboard":
         else:
             st.caption("No assigned-person action items to draft emails for yet.")
 
-# ---------------------------------------------------------------- Ask Questions
-elif page == "❓ Ask Questions":
-    data = st.session_state.analysis
-    if not data:
-        st.info("Analyze a meeting first.")
-    else:
-        st.header("❓ Ask About This Meeting")
-        st.caption('Try: "What tasks were assigned to me?" or "What did we decide about the homepage?"')
-        q = st.text_input("Your question")
-        if st.button("Ask", type="primary", disabled=not q.strip()):
-            with st.spinner("Thinking..."):
-                answer = answer_question(
-                    q, data["plain_text"], data["action_items"], st.session_state.user_name,
-                    decisions=data["decisions"], summary=data["summary"],
-                )
-            st.markdown(f"**Answer:** {answer}")
-
-# ---------------------------------------------------------------- Search
-elif page == "🔎 Search":
-    data = st.session_state.analysis
-    if not data:
-        st.info("Analyze a meeting first.")
-    else:
-        st.header("🔎 Search Transcript")
-        query = st.text_input("Search term")
-        if query:
-            results = search_transcript(data["transcript"], query)
-            st.caption(f"{len(results)} match(es) found")
-            for r in results:
-                st.markdown(f"> {r}")
-
 # ---------------------------------------------------------------- History
 elif page == "📜 History":
     st.header("📜 Meeting History")
@@ -1084,19 +1053,25 @@ elif page == "📤 Export":
         st.subheader("Downloadable Report")
         c1, c2 = st.columns(2)
         with c1:
-            docx_bytes = report_to_docx_bytes(
-                data["title"], data["summary"], data["key_points"],
-                data["decisions"], data["action_items"], data["entities"],
-            )
-            st.download_button("⬇️ Download Report (DOCX)", docx_bytes,
-                                file_name=f"{data['title']}_report.docx")
+            try:
+                docx_bytes = report_to_docx_bytes(
+                    data["title"], data["summary"], data["key_points"],
+                    data["decisions"], data["action_items"], data["entities"],
+                )
+                st.download_button("⬇️ Download Report (DOCX)", docx_bytes,
+                                    file_name=f"{data['title']}_report.docx")
+            except Exception as e:
+                st.error(f"Couldn't generate the DOCX report: {e}")
         with c2:
-            pdf_bytes = report_to_pdf_bytes(
-                data["title"], data["summary"], data["key_points"],
-                data["decisions"], data["action_items"], data["entities"],
-            )
-            st.download_button("⬇️ Download Report (PDF)", pdf_bytes,
-                                file_name=f"{data['title']}_report.pdf")
+            try:
+                pdf_bytes = report_to_pdf_bytes(
+                    data["title"], data["summary"], data["key_points"],
+                    data["decisions"], data["action_items"], data["entities"],
+                )
+                st.download_button("⬇️ Download Report (PDF)", pdf_bytes,
+                                    file_name=f"{data['title']}_report.pdf")
+            except Exception as e:
+                st.error(f"Couldn't generate the PDF report: {e}")
 
         st.subheader("Export Tasks to Task-Management Systems")
         st.caption("CSV imports directly into Trello, Asana, Jira, ClickUp and Notion. "
