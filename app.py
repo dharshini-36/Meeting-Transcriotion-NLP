@@ -280,13 +280,25 @@ def _keyword_fallback(task_text: str) -> str:
 
 
 def detect_priority(task_text: str) -> str:
-    try:
-        classifier = load_zero_shot()
-        result = classifier(task_text, candidate_labels=LABELS)
-        top_label = result["labels"][0]
-        return top_label.replace(" priority", "").capitalize()
-    except Exception:
-        return _keyword_fallback(task_text)
+    # NOTE: zero-shot DistilBERT priority scoring is disabled here on purpose.
+    # Streamlit Community Cloud's free tier (~1GB RAM) can't reliably hold
+    # the summarizer model AND the zero-shot model in memory at the same
+    # time -- doing so was causing silent out-of-memory crashes mid-analysis
+    # (no error page, the run just stops). The keyword-based fallback below
+    # is fast, needs no extra model/memory, and is accurate enough for
+    # obvious urgency cues ("urgent", "asap", "today", etc). If you deploy
+    # this on a machine with more RAM, you can restore zero-shot scoring by
+    # uncommenting the block below.
+    return _keyword_fallback(task_text)
+
+    # --- higher-accuracy version (needs more RAM than free-tier Streamlit Cloud) ---
+    # try:
+    #     classifier = load_zero_shot()
+    #     result = classifier(task_text, candidate_labels=LABELS)
+    #     top_label = result["labels"][0]
+    #     return top_label.replace(" priority", "").capitalize()
+    # except Exception:
+    #     return _keyword_fallback(task_text)
 
 
 def annotate_priorities(action_items: list) -> list:
