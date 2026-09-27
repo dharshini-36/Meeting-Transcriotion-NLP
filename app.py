@@ -33,9 +33,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import spacy
 from transformers import pipeline
-from deep_translator import GoogleTranslator
 from docx import Document
 from fpdf import FPDF
+from fpdf.enums import XPos, YPos
 
 # ============================================================================
 # SECTION 1: NLP PIPELINE (NER, summarization, action/decision extraction)
@@ -429,32 +429,6 @@ def search_transcript(transcript: str, query: str, context_chars: int = 60) -> l
 
 
 # ============================================================================
-# SECTION 5: TRANSLATION
-# ============================================================================
-
-LANGUAGES = {
-    "English": "en", "Hindi": "hi", "Tamil": "ta", "Telugu": "te",
-    "Kannada": "kn", "Malayalam": "ml", "French": "fr", "German": "de",
-    "Spanish": "es", "Chinese (Simplified)": "zh-CN", "Japanese": "ja",
-    "Arabic": "ar", "Russian": "ru", "Portuguese": "pt",
-}
-
-
-def translate_text(text: str, target_lang_code: str, source_lang_code: str = "auto") -> str:
-    if not text.strip():
-        return ""
-    try:
-        chunks = [text[i:i + 4500] for i in range(0, len(text), 4500)]
-        translated_chunks = [
-            GoogleTranslator(source=source_lang_code, target=target_lang_code).translate(c)
-            for c in chunks
-        ]
-        return " ".join(translated_chunks)
-    except Exception as e:
-        return f"[Translation failed: {e}]"
-
-
-# ============================================================================
 # SECTION 6: DATABASE (meeting history, SQLite)
 # ============================================================================
 
@@ -580,6 +554,16 @@ def report_to_docx_bytes(meeting_title, summary, key_points, decisions, action_i
 
 
 def report_to_pdf_bytes(meeting_title, summary, key_points, decisions, action_items, entities) -> bytes:
+    """
+    FIX: fpdf2's multi_cell(), when called with width=0 (i.e. "use the full
+    remaining line width"), leaves the cursor sitting at the RIGHT margin
+    afterwards instead of resetting it to the left. The next multi_cell(0, ...)
+    call then computes its available width as (cursor_x -> right_margin),
+    which is ~0, and fpdf2 raises "Not enough horizontal space to render a
+    single character". Passing new_x=XPos.LMARGIN, new_y=YPos.NEXT to every
+    multi_cell() call explicitly resets the cursor to the next line's left
+    margin, which is what actually fixes it (this was tested end-to-end).
+    """
     pdf = FPDF()
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -594,43 +578,43 @@ def report_to_pdf_bytes(meeting_title, summary, key_points, decisions, action_it
         return re.sub(r"\S{40,}", lambda m: " ".join(m.group(0)[i:i + 40] for i in range(0, len(m.group(0)), 40)), t)
 
     pdf.set_font("Helvetica", "B", 16)
-    pdf.multi_cell(0, 10, clean(f"Meeting Report: {meeting_title}"))
+    pdf.multi_cell(0, 10, clean(f"Meeting Report: {meeting_title}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(2)
 
     def section(title, body_lines):
         pdf.set_font("Helvetica", "B", 13)
-        pdf.multi_cell(0, 8, clean(title))
+        pdf.multi_cell(0, 8, clean(title), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.set_font("Helvetica", "", 11)
         for line in body_lines:
-            pdf.multi_cell(0, 6, clean(f"- {line}"))
+            pdf.multi_cell(0, 6, clean(f"- {line}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.ln(2)
 
     pdf.set_font("Helvetica", "B", 13)
-    pdf.multi_cell(0, 8, "Meeting Summary")
+    pdf.multi_cell(0, 8, "Meeting Summary", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font("Helvetica", "", 11)
-    pdf.multi_cell(0, 6, clean(summary or "N/A"))
+    pdf.multi_cell(0, 6, clean(summary or "N/A"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(2)
 
     section("Key Discussion Points", key_points or ["N/A"])
     section("Decisions Made", decisions or ["N/A"])
 
     pdf.set_font("Helvetica", "B", 13)
-    pdf.multi_cell(0, 8, "Action Items")
+    pdf.multi_cell(0, 8, "Action Items", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font("Helvetica", "", 11)
     for item in action_items:
         line = f"{item.get('person','')} -> {item.get('task','')} (Due: {item.get('deadline','')}, Priority: {item.get('priority','')})"
-        pdf.multi_cell(0, 6, clean(f"- {line}"))
+        pdf.multi_cell(0, 6, clean(f"- {line}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(2)
 
     pdf.set_font("Helvetica", "B", 13)
-    pdf.multi_cell(0, 8, "Important Entities")
+    pdf.multi_cell(0, 8, "Important Entities", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font("Helvetica", "", 11)
-    pdf.multi_cell(0, 6, clean(f"People: {', '.join(entities.get('people', [])) or 'N/A'}"))
-    pdf.multi_cell(0, 6, clean(f"Organizations: {', '.join(entities.get('organizations', [])) or 'N/A'}"))
-    pdf.multi_cell(0, 6, clean(f"Dates: {', '.join(entities.get('dates', [])) or 'N/A'}"))
-    pdf.multi_cell(0, 6, clean(f"Projects/Tech: {', '.join(entities.get('projects_tech', [])) or 'N/A'}"))
+    pdf.multi_cell(0, 6, clean(f"People: {', '.join(entities.get('people', [])) or 'N/A'}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.multi_cell(0, 6, clean(f"Organizations: {', '.join(entities.get('organizations', [])) or 'N/A'}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.multi_cell(0, 6, clean(f"Dates: {', '.join(entities.get('dates', [])) or 'N/A'}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.multi_cell(0, 6, clean(f"Projects/Tech: {', '.join(entities.get('projects_tech', [])) or 'N/A'}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-    return bytes(pdf.output(dest="S"))
+    return bytes(pdf.output())
 
 
 # ============================================================================
@@ -978,14 +962,3 @@ elif page == "📤 Export":
         st.caption("CSV imports directly into Trello, Asana, Jira, ClickUp and Notion.")
         csv_bytes = action_items_to_csv_bytes(data["action_items"])
         st.download_button("⬇️ Tasks as CSV", csv_bytes, file_name=f"{data['title']}_tasks.csv")
-
-        st.subheader("Translate Report")
-        target_lang = st.selectbox("Translate summary + action items to:", list(LANGUAGES.keys()))
-        if st.button("Translate"):
-            with st.spinner("Translating..."):
-                t_summary = translate_text(data["summary"], LANGUAGES[target_lang])
-                t_points = [translate_text(p, LANGUAGES[target_lang]) for p in data["key_points"]]
-            st.markdown(f"**Summary ({target_lang}):** {t_summary}")
-            st.markdown(f"**Key Points ({target_lang}):**")
-            for p in t_points:
-                st.markdown(f"- {p}")
