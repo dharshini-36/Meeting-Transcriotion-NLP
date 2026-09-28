@@ -5,7 +5,6 @@ Everything runs on free, local, open-source NLP models:
   - spaCy            -> Named Entity Recognition (people, orgs, dates)
   - DistilBART        -> abstractive summarization
   - DistilBERT-SQuAD  -> extractive question answering
-  - deep-translator    -> free translation (Google Translate web endpoint)
 
 No OpenAI/Gemini/any paid API required. Models download once on first run
 and are cached, so subsequent loads are fast.
@@ -43,7 +42,7 @@ from fpdf.enums import XPos, YPos
 
 ACTION_VERBS = {
     "fix", "prepare", "complete", "finish", "build", "test", "review",
-    "send", "update", "create", "design", "deploy", "write", "schedule",
+    "send", "update", "create", "deploy", "write", "schedule",
     "follow up", "investigate", "implement", "check", "share", "finalize",
 }
 
@@ -205,36 +204,71 @@ def extract_decisions(text: str) -> list:
     return decisions
 
 
-def extract_action_items(text: str, speaker_map: dict = None) -> list:
+FIRST_PERSON_RE = re.compile(
+    r"\b(i will|i'll|i am going to|i'm going to|i should|i need to|i have to|i can)\b", re.IGNORECASE
+)
+
+
+def extract_action_items(segments: list, known_speakers: list = None) -> list:
+    """
+    Works one speaker turn at a time, so every task knows who said it.
+    Owner rules: "Name, please ..." -> Name; "I will ..." -> the speaker;
+    otherwise a name mentioned in the sentence; otherwise the speaker.
+    Questions, decisions and past-tense statements are not tasks.
+    """
     nlp = load_spacy()
-    doc = nlp(text)
+    known = [s for s in (known_speakers or []) if s != "Unknown Speaker"]
     items = []
 
-    for sent in doc.sents:
-        s_text = sent.text.strip()
-        if not s_text:
-            continue
+    for seg in segments:
+        speaker = seg["speaker"] if seg["speaker"] != "Unknown Speaker" else None
+        doc = nlp(seg["text"])
+        sents = list(doc.sents)
 
-        has_cue = any(re.search(cue, s_text, re.IGNORECASE) for cue in ACTION_CUES)
-        has_verb = any(v in s_text.lower() for v in ACTION_VERBS)
-        if not (has_cue or has_verb):
-            continue
+        for idx, sent in enumerate(sents):
+            s_text = sent.text.strip()
+            if not s_text or s_text.endswith("?"):
+                continue
+            if any(re.search(c, s_text, re.IGNORECASE) for c in DECISION_CUES):
+                continue
 
-        people = [ent.text for ent in sent.ents if ent.label_ == "PERSON"]
-        dates = [ent.text for ent in sent.ents if ent.label_ in ("DATE", "TIME")]
+            has_cue = any(re.search(cue, s_text, re.IGNORECASE) for cue in ACTION_CUES)
+            has_verb = any(re.search(rf"\b{re.escape(v)}\b", s_text, re.IGNORECASE) for v in ACTION_VERBS)
+            if not (has_cue or has_verb):
+                continue
 
-        person = people[0] if people else None
-        if not person and speaker_map:
-            person = speaker_map.get(sent.start_char)
+            addressee = next(
+                (n for n in known if n != speaker and re.match(rf"\s*{re.escape(n)}\s*,", s_text, re.IGNORECASE)),
+                None,
+            )
+            if addressee:
+                person = addressee
+            elif FIRST_PERSON_RE.search(s_text) and speaker:
+                person = speaker
+            else:
+                ent_people = [e.text for e in sent.ents if e.label_ == "PERSON"]
+                named = next((n for n in known if re.search(rf"\b{re.escape(n)}\b", s_text)), None)
+                person = named or (ent_people[0] if ent_people else None) or speaker or "Unassigned"
 
-        deadline = dates[0] if dates else "Not specified"
+            dates = [e.text for e in sent.ents if e.label_ in ("DATE", "TIME")]
+            deadline = dates[0] if dates else "Not specified"
 
-        items.append({
-            "person": person or "Unassigned",
-            "task": s_text,
-            "deadline": deadline,
-            "raw_sentence": s_text,
-        })
+            # priority: this sentence first, else a neighbouring sentence in the same turn
+            priority = detect_priority(s_text)
+            if priority == "Medium":
+                for j in (idx - 1, idx + 1):
+                    if 0 <= j < len(sents):
+                        p = detect_priority(sents[j].text)
+                        if p != "Medium":
+                            priority = p
+                            break
+
+            items.append({
+                "person": person,
+                "task": s_text,
+                "deadline": deadline,
+                "priority": priority,
+            })
 
     return items
 
@@ -244,26 +278,26 @@ def extract_action_items(text: str, speaker_map: dict = None) -> list:
 # ============================================================================
 
 URGENT_WORDS = {"urgent", "asap", "immediately", "critical", "blocker", "today", "tomorrow"}
-LOW_WORDS = {"eventually", "whenever", "someday", "nice to have", "low priority"}
+LOW_WORDS = {"eventually", "whenever", "someday", "nice to have", "low priority",
+             "not urgent", "not blocking", "not critical", "no rush", "no hurry"}
 
 
 def detect_priority(task_text: str) -> str:
-    # Keyword-based on purpose: Streamlit Community Cloud's free tier
-    # (~1GB RAM) can't reliably hold the summarizer model AND a separate
-    # zero-shot classifier in memory at once — that combo was causing
-    # silent out-of-memory crashes mid-analysis. This is fast, needs no
-    # extra model/memory, and is accurate enough for clear urgency cues.
+    # Keyword-based on purpose (keeps memory low on Streamlit's free tier).
+    # Low/negated phrases ("not urgent") are checked FIRST, otherwise the
+    # word "urgent" inside "not urgent" would wrongly give High.
     t = task_text.lower()
-    if any(w in t for w in URGENT_WORDS):
-        return "High"
     if any(w in t for w in LOW_WORDS):
         return "Low"
+    if any(re.search(rf"\b{w}\b", t) for w in URGENT_WORDS):
+        return "High"
     return "Medium"
 
 
 def annotate_priorities(action_items: list) -> list:
+    # keep the priority already decided during extraction; only fill gaps
     for item in action_items:
-        item["priority"] = detect_priority(item.get("task", ""))
+        item["priority"] = item.get("priority") or detect_priority(item.get("task", ""))
     return action_items
 
 
@@ -742,12 +776,15 @@ def run_pipeline(transcript_raw: str, meeting_title: str):
         summary = summarize_text(plain_text)
     with st.spinner("Extracting entities..."):
         entities = extract_entities(plain_text)
+    entities["people"] = sorted(
+        set(entities["people"]) | {s for s in speaker_counts if s != "Unknown Speaker"}
+    )
     with st.spinner("Identifying key discussion points..."):
         key_points = extract_key_points(plain_text)
     with st.spinner("Detecting decisions..."):
         decisions = extract_decisions(plain_text)
     with st.spinner("Extracting action items..."):
-        action_items = extract_action_items(plain_text, speaker_map=char_map)
+        action_items = extract_action_items(segments, known_speakers=list(speaker_counts))
     with st.spinner("Scoring priority..."):
         action_items = annotate_priorities(action_items)
     for item in action_items:
@@ -906,7 +943,13 @@ elif page == "📊 Dashboard":
                 with st.expander(f"✉️ To: {d['to']} — {d['subject']}"):
                     st.text(d["body"])
         else:
-            st.caption("No assigned-person action items to draft emails for yet.")
+            if data["action_items"]:
+                st.warning(
+                    "Tasks were found, but none could be linked to a person, so no drafts were made. "
+                    "Start each line of the transcript with the speaker's name, e.g. 'Priya: I will fix the bug by Friday.'"
+                )
+            else:
+                st.caption("No action items detected, so there are no email drafts.")
 
 # ---------------------------------------------------------------- History
 elif page == "📜 History":
@@ -933,7 +976,7 @@ elif page == "📤 Export":
     if not data:
         st.info("Analyze a meeting first.")
     else:
-        st.header("📤 Export & Translate")
+        st.header("📤 Export")
 
         st.subheader("Downloadable Report")
         c1, c2 = st.columns(2)
