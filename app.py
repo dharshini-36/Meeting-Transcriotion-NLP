@@ -766,6 +766,34 @@ with st.sidebar:
                "keyword-based priority detection.")
 
 
+ANALYSIS_VERSION = 2
+
+
+def refresh_if_stale(data: dict) -> dict:
+    """
+    Analyses saved (or kept in memory) by an older version of the app have every
+    task marked 'Unassigned', which is why no email drafts appear. Rebuild the
+    action items from the stored transcript so old data works without re-analyzing.
+    """
+    if data.get("version") == ANALYSIS_VERSION:
+        return data
+    transcript = clean_transcript(data.get("transcript", ""))
+    if not transcript:
+        return data
+    segments, speaker_counts = parse_speakers(transcript)
+    items = annotate_priorities(extract_action_items(segments, known_speakers=list(speaker_counts)))
+    for item in items:
+        item["status"] = "Pending"
+    data["action_items"] = items
+    data["speaker_counts"] = speaker_counts
+    entities = data.setdefault("entities", {})
+    entities["people"] = sorted(
+        set(entities.get("people", [])) | {s for s in speaker_counts if s != "Unknown Speaker"}
+    )
+    data["version"] = ANALYSIS_VERSION
+    return data
+
+
 def run_pipeline(transcript_raw: str, meeting_title: str):
     transcript_raw = clean_transcript(transcript_raw)
     segments, speaker_counts = parse_speakers(transcript_raw)
@@ -800,6 +828,7 @@ def run_pipeline(transcript_raw: str, meeting_title: str):
         "decisions": decisions,
         "action_items": action_items,
         "speaker_counts": speaker_counts,
+        "version": ANALYSIS_VERSION,
     }
     st.session_state.analysis = data
     save_meeting(meeting_title, transcript_raw, summary, data)
@@ -854,6 +883,8 @@ if page == "🆕 New Meeting":
 # ---------------------------------------------------------------- Dashboard
 elif page == "📊 Dashboard":
     data = st.session_state.analysis
+    if data:
+        data = refresh_if_stale(data)
     if not data:
         st.info("No meeting analyzed yet. Go to **New Meeting** first, or load one from **History**.")
     else:
@@ -973,6 +1004,8 @@ elif page == "📜 History":
 # ---------------------------------------------------------------- Export
 elif page == "📤 Export":
     data = st.session_state.analysis
+    if data:
+        data = refresh_if_stale(data)
     if not data:
         st.info("Analyze a meeting first.")
     else:
